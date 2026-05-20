@@ -1,0 +1,1920 @@
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Dict, Any, Optional
+from collections import deque
+import uuid
+from datetime import datetime, timezone
+import asyncio
+import base64
+import io
+import json
+import re
+import shutil
+import zipfile
+
+import pandas as pd
+import requests
+from google import genai
+from google.genai import types as genai_types
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
+from docx import Document
+
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+GENERATED_PINS_DIR = ROOT_DIR / "generated_pins"
+GENERATED_PINS_DIR.mkdir(parents=True, exist_ok=True)
+
+# MongoDB optional — omit MONGO_URL for stateless deploys (memory-only sessions; downloads work until evicted or restart).
+mongo_url = os.environ.get("MONGO_URL", "").strip()
+client: Optional[AsyncIOMotorClient] = None
+db: Optional[Any] = None
+if mongo_url:
+    client = AsyncIOMotorClient(mongo_url)
+    db_name = os.environ.get("DB_NAME", "pinterest_pins").strip() or "pinterest_pins"
+    db = client[db_name]
+
+MAX_EPHEMERAL_SESSIONS = max(1, int(os.environ.get("MAX_EPHEMERAL_SESSIONS", "40")))
+_EPHEMERAL_LOCK = asyncio.Lock()
+_EPHEMERAL_SESSION_ORDER: deque[str] = deque()
+_EPHEMERAL_PINS_BY_SESSION: Dict[str, List[Dict[str, Any]]] = {}
+_EPHEMERAL_PIN_BY_ID: Dict[str, Dict[str, Any]] = {}
+
+
+async def _evict_oldest_ephemeral_sessions() -> None:
+    while len(_EPHEMERAL_SESSION_ORDER) > MAX_EPHEMERAL_SESSIONS:
+        old_sid = _EPHEMERAL_SESSION_ORDER.popleft()
+        old_pins = _EPHEMERAL_PINS_BY_SESSION.pop(old_sid, [])
+        for pin in old_pins:
+            _EPHEMERAL_PIN_BY_ID.pop(pin.get("pin_id"), None)
+        old_dir = GENERATED_PINS_DIR / old_sid
+        if old_dir.is_dir():
+            await asyncio.to_thread(lambda: shutil.rmtree(old_dir, ignore_errors=True))
+
+
+async def _remember_ephemeral_session(session_id: str, pins: List[Dict[str, Any]]) -> None:
+    async with _EPHEMERAL_LOCK:
+        _EPHEMERAL_SESSION_ORDER.append(session_id)
+        _EPHEMERAL_PINS_BY_SESSION[session_id] = pins
+        for pin in pins:
+            _EPHEMERAL_PIN_BY_ID[pin["pin_id"]] = pin
+        await _evict_oldest_ephemeral_sessions()
+
+# Create the main app without a prefix
+app = FastAPI()
+app.mount("/api/static/pins", StaticFiles(directory=str(GENERATED_PINS_DIR)), name="pin-static")
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+
+# Define Models
+class StatusCheck(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StatusCheckCreate(BaseModel):
+    client_name: str
+
+
+class PinRecord(BaseModel):
+    pin_id: str
+    session_id: str
+    pin_name: str = ""
+    pic_no: str = ""
+    quote: str
+    pinrest_input: str = ""
+    meta_title: str
+    meta_description: str
+    hashtags: str
+    tag_topic: str
+    creator: str
+    timing_link: str
+    ai_prompt: str
+    mode: str = "ai"
+    filename: str
+    image_url: str
+    created_at: str
+    pin_title_2nd_line: str = ""
+    pin_title_top: str = ""
+    pin_title_center: str = ""
+    pin_title_bottom: str = ""
+    pin_size: str = "standard"
+
+
+class GeneratePinsResponse(BaseModel):
+    session_id: str
+    total_generated: int
+    skipped_rows: int = 0
+    warnings: List[str] = []
+    mode_used: str = "ai"
+    auto_switched: bool = False
+    switch_message: str = ""
+    total_rows_processed: int = 0
+    images_matched: int = 0
+    missing_images_count: int = 0
+    pins: List[PinRecord]
+
+
+class GenerationSummary(BaseModel):
+    generated_count: int
+    completed: bool
+
+
+REQUIRED_COLUMNS = [
+    "PIC NO.",
+    "PIN NAME",
+    "Quote",
+    "PINREST INPUT",
+    "Meta Title",
+    "Meta Description",
+    "Hashtags",
+    "TAG TOPIC",
+    "CREATOR",
+    "Timing Link",
+]
+
+# Parsed when present; not required for upload validation
+OPTIONAL_COLUMNS = [
+    "PIN TITLE 2ND LINE",
+    "PIN TITLE - TOP",
+    "PIN TITLE - CENTER",
+    "PIN TITLE - BOTTOM",
+]
+
+PIN_SIZE_PRESETS: Dict[str, tuple[int, int]] = {
+    "standard": (1000, 1500),
+    "long": (1000, 2100),
+    "big": (1200, 2520),
+}
+
+# Legacy preset names (still accepted in API / old clients) → reference px at 1000×1500 canvas height
+LEGACY_FONT_SIZE_ALIASES: Dict[str, int] = {
+    "small": 72,
+    "medium": 96,
+    "large": 120,
+    "xl": 144,
+}
+
+VALID_FONT_STYLES = {"bold", "italic", "chewy", "cursive"}
+
+HEADER_ALIASES: Dict[str, List[str]] = {
+    "PIC NO.": ["picno", "picno.", "picnumber", "pic"],
+    "PIN NAME": ["pinname"],
+    "Quote": ["quote", "quotes", "pinquote", "quotation", "pintitle1stlinebold"],
+    "PINREST INPUT": ["pinrestinput"],
+    "Meta Title": ["metatitle", "title", "pintitle", "pinrestinput", "pintitle1stlinebold"],
+    "Meta Description": ["metadescription", "metadesc", "description", "pindescription", "pindescription1", "pindescription2"],
+    "Hashtags": ["hashtags", "hashtag", "tags"],
+    "TAG TOPIC": ["tagtopic", "topic", "tag", "boardtopic", "pintitle2ndline"],
+    "CREATOR": ["creator", "author", "owner"],
+    "Timing Link": ["timinglink", "link", "url", "destinationlink", "timing", "links"],
+    # Excel: "PIN TITLE - 2ND LINE" / END LINE → bottom white bar of each pin
+    "PIN TITLE 2ND LINE": [
+        "pintitle2ndline",
+        "pintitle2ndlinerow",
+        "pintitlesecondline",
+        "pintitlesubline",
+        "pintitleline2",
+        "secondlinetitle",
+        "endline",
+    ],
+    "PIN TITLE - TOP": [
+        "pintitletop",
+        "pintitletopbold",
+        "pintitletoprow",
+    ],
+    "PIN TITLE - CENTER": [
+        "pintitlecenter",
+        "pintitlecenterbold",
+        "pintitlecentre",
+    ],
+    "PIN TITLE - BOTTOM": [
+        "pintitlebottom",
+        "pintitlebottombold",
+    ],
+}
+
+MANDATORY_COLUMNS = {"PIN NAME", "Quote"}
+
+MOCK_IMAGE_URLS = [
+    "https://static.prod-images.emergentagent.com/jobs/bf3547ed-e1b7-4e48-9bc6-e1aa83f707d1/images/328f52aa34fc8ae7916966a2d8faab8917150a4703a8c1f48bf8160a77a47d7b.png",
+    "https://static.prod-images.emergentagent.com/jobs/bf3547ed-e1b7-4e48-9bc6-e1aa83f707d1/images/65f99e0695c649136b49c9330d20107f409043b4a9c73ede513a95cd50db4d51.png",
+    "https://static.prod-images.emergentagent.com/jobs/bf3547ed-e1b7-4e48-9bc6-e1aa83f707d1/images/78b6c57beda2383b84eb8a1aeb417b512678dde21a228d423cdb33dc6268a902.png",
+    "https://static.prod-images.emergentagent.com/jobs/bf3547ed-e1b7-4e48-9bc6-e1aa83f707d1/images/426acf8cd530ec7a944d38ff5a60f405e5214cfdf821cc7f02a53edaef6881ea.png",
+]
+
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+GENERATION_TRACKER: Dict[str, Dict[str, Any]] = {}
+
+
+class AIQuotaExceededError(Exception):
+    pass
+
+
+class AIImageGenerationError(Exception):
+    pass
+
+
+def is_quota_error_message(message: str) -> bool:
+    lowered = clean_text(message).lower()
+    markers = [
+        "quota",
+        "resource_exhausted",
+        "resourceexhausted",
+        "429",
+        "rate limit",
+        "too many requests",
+        "insufficient quota",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def normalize_pic_no(value: Any) -> str:
+    raw = clean_text(value)
+    if not raw:
+        return ""
+
+    sanitized = raw.replace(",", "").strip()
+    if re.fullmatch(r"\d+", sanitized):
+        return str(int(sanitized))
+
+    if re.fullmatch(r"\d+\.0+", sanitized):
+        return str(int(float(sanitized)))
+
+    return ""
+
+
+def is_supported_image_name(filename: str) -> bool:
+    return Path(filename).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+
+
+def extract_zip_image_entries(zip_bytes: bytes) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
+            for item in archive.infolist():
+                if item.is_dir():
+                    continue
+                base_name = Path(item.filename).name
+                if not base_name or not is_supported_image_name(base_name):
+                    continue
+                with archive.open(item) as file_obj:
+                    entries.append({"filename": base_name, "content": file_obj.read()})
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Invalid ZIP file for custom images") from exc
+
+    return entries
+
+
+def slugify_filename(text: str, index: int) -> str:
+    raw = clean_text(text).lower()
+    sanitized = re.sub(r"[^a-z0-9\s-]", "", raw)
+    sanitized = re.sub(r"\s+", "-", sanitized)
+    sanitized = re.sub(r"-+", "-", sanitized).strip("-")
+    return sanitized[:90] if sanitized else f"pin-{index + 1}"
+
+
+def build_ai_prompt(meta_title: str, meta_description: str, tag_topic: str) -> str:
+    title = clean_text(meta_title)
+    description = clean_text(meta_description)
+    topic = clean_text(tag_topic) or "lifestyle"
+    return (
+        f"photorealistic Pinterest aesthetic scene about {topic}, inspired by '{title}', "
+        f"{description}, soft lighting, lifestyle photography, vertical composition, high detail, "
+        "unique framing and camera angle, emotionally engaging visual storytelling, no text"
+    )
+
+
+def create_placeholder_background() -> Image.Image:
+    image = Image.new("RGB", (1000, 1500), (230, 230, 235))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([(0, 0), (1000, 450)], fill=(210, 220, 235))
+    draw.rectangle([(0, 450), (1000, 950)], fill=(180, 195, 215))
+    draw.rectangle([(0, 950), (1000, 1500)], fill=(145, 160, 185))
+    return image
+
+
+def load_backgrounds() -> List[Image.Image]:
+    backgrounds: List[Image.Image] = []
+    for url in MOCK_IMAGE_URLS:
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            backgrounds.append(image)
+        except Exception:
+            logger.warning("Failed to fetch mock image: %s", url)
+    if not backgrounds:
+        backgrounds.append(create_placeholder_background())
+    return backgrounds
+
+
+def _image_bytes_from_genai_response(response: Any) -> bytes | None:
+    """Extract first image bytes from google-genai generate_content response."""
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        if not content:
+            continue
+        for part in getattr(content, "parts", None) or []:
+            inline = getattr(part, "inline_data", None)
+            if not inline:
+                continue
+            data = getattr(inline, "data", None)
+            if data is None:
+                continue
+            if isinstance(data, str):
+                return base64.b64decode(data)
+            if isinstance(data, (bytes, bytearray)):
+                return bytes(data)
+    return None
+
+
+def _generate_gemini_image_sync(prompt: str, api_key: str) -> bytes:
+    """Blocking call to Google Gen AI (image-capable Gemini). Not on PyPI: replaced emergentintegrations."""
+    client = genai.Client(api_key=api_key)
+    system_instruction = (
+        "You generate photorealistic Pinterest-style vertical background images. "
+        "Never include text, logos, or watermarks in the image."
+    )
+    user_text = (
+        "Create a high-quality photorealistic Pinterest background image in vertical composition (2:3 ratio). "
+        "Modern clean aesthetic, soft cinematic lighting, strong subject clarity, no text in image. "
+        f"Context: {prompt}"
+    )
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        response_modalities=["IMAGE", "TEXT"],
+    )
+    # Try models in order (API availability varies by account / rollout).
+    model_ids = [
+        "gemini-2.0-flash-preview-image-generation",
+        "gemini-2.5-flash-image",
+        "gemini-3-pro-image-preview",
+    ]
+    last_detail = ""
+    for model_id in model_ids:
+        try:
+            response = client.models.generate_content(
+                model=model_id,
+                contents=user_text,
+                config=config,
+            )
+            raw = _image_bytes_from_genai_response(response)
+            if raw:
+                return raw
+            last_detail = f"model {model_id} returned no image part"
+            logger.warning("Gemini %s: %s", model_id, last_detail)
+        except AIQuotaExceededError:
+            raise
+        except Exception as exc:
+            raw_message = str(exc)
+            if is_quota_error_message(raw_message):
+                raise AIQuotaExceededError(raw_message) from exc
+            last_detail = f"{model_id}: {exc}"
+            logger.warning("Gemini image generation failed (%s)", last_detail)
+    raise AIImageGenerationError(
+        last_detail or "Gemini image generation failed (no image in response for all models)"
+    )
+
+
+async def generate_gemini_background(
+    prompt: str,
+    api_key: str,
+    session_id: str,
+    index: int,
+    timeout_seconds: int = 90,
+) -> Image.Image:
+    del session_id, index  # kept for API compatibility with callers
+    try:
+        raw_bytes = await asyncio.wait_for(
+            asyncio.to_thread(_generate_gemini_image_sync, prompt, api_key),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise AIImageGenerationError("Gemini request timed out") from exc
+    except AIQuotaExceededError:
+        raise
+    except AIImageGenerationError:
+        raise
+    except Exception as exc:
+        raw_message = str(exc)
+        if is_quota_error_message(raw_message):
+            raise AIQuotaExceededError(raw_message) from exc
+        raise AIImageGenerationError(raw_message) from exc
+
+    if not raw_bytes:
+        raise AIImageGenerationError("Gemini returned empty image data")
+
+    return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+
+async def build_ai_background_pool(records: List[Dict[str, Any]], session_id: str) -> List[Image.Image]:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise AIImageGenerationError("Gemini API key missing")
+
+    unique_prompts: List[str] = []
+    for row in records:
+        prompt = build_ai_prompt(
+            row.get("Meta Title", ""),
+            row.get("Meta Description", ""),
+            row.get("TAG TOPIC", ""),
+        )
+        if prompt not in unique_prompts:
+            unique_prompts.append(prompt)
+
+    pool_size = min(12, max(3, len(records) // 10 if len(records) >= 20 else 3), len(unique_prompts))
+    selected_prompts = unique_prompts[:pool_size]
+    if not selected_prompts:
+        raise AIImageGenerationError("No prompts available for image generation")
+
+    preflight_image = await generate_gemini_background(
+        selected_prompts[0],
+        api_key,
+        session_id,
+        0,
+        timeout_seconds=25,
+    )
+
+    semaphore = asyncio.Semaphore(2)
+
+    async def worker(idx: int, prompt: str) -> Image.Image | None:
+        async with semaphore:
+            try:
+                return await generate_gemini_background(prompt, api_key, session_id, idx)
+            except AIQuotaExceededError:
+                raise
+            except Exception as exc:
+                logger.warning("Gemini background generation failed at index %s: %s", idx, exc)
+                return None
+
+    generated: List[Image.Image | None] = [preflight_image]
+    remaining_prompts = selected_prompts[1:]
+    if remaining_prompts:
+        generated.extend(
+            await asyncio.gather(*(worker(idx + 1, prompt) for idx, prompt in enumerate(remaining_prompts)))
+        )
+
+    usable = [image for image in generated if image is not None]
+    if not usable:
+        raise AIImageGenerationError("Gemini did not return usable images")
+    return usable
+
+
+def apply_background_variation(base_image: Image.Image, index: int) -> Image.Image:
+    varied = base_image.copy().convert("RGB")
+    width, height = varied.size
+
+    zoom_factor = 1.04 + ((index % 5) * 0.01)
+    crop_width = int(width / zoom_factor)
+    crop_height = int(height / zoom_factor)
+    x_shift = (index * 13) % max(1, width - crop_width + 1)
+    y_shift = (index * 17) % max(1, height - crop_height + 1)
+    varied = varied.crop((x_shift, y_shift, x_shift + crop_width, y_shift + crop_height)).resize((width, height), Image.Resampling.LANCZOS)
+
+    brightness = 0.93 + ((index % 7) * 0.02)
+    contrast = 0.92 + ((index % 6) * 0.03)
+    color = 0.95 + ((index % 5) * 0.02)
+
+    varied = ImageEnhance.Brightness(varied).enhance(brightness)
+    varied = ImageEnhance.Contrast(varied).enhance(contrast)
+    varied = ImageEnhance.Color(varied).enhance(color)
+    return varied
+
+
+def parse_docx_quotes(file_bytes: bytes) -> List[str]:
+    try:
+        document = Document(io.BytesIO(file_bytes))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid Word file. Please upload a .docx file.") from exc
+
+    quotes = [clean_text(paragraph.text) for paragraph in document.paragraphs if clean_text(paragraph.text)]
+    if not quotes:
+        raise HTTPException(status_code=400, detail="No usable quote text found in Word file.")
+    return quotes
+
+
+def parse_image_links(image_links_raw: str) -> List[str]:
+    if not clean_text(image_links_raw):
+        return []
+    chunks = re.split(r"[\n,]", image_links_raw)
+    return [clean_text(chunk) for chunk in chunks if clean_text(chunk).startswith("http")]
+
+
+def load_custom_image_assets(
+    file_entries: List[Dict[str, Any]],
+    image_links_raw: str,
+) -> List[Dict[str, Any]]:
+    assets: List[Dict[str, Any]] = []
+
+    for entry in file_entries:
+        filename = clean_text(entry.get("filename"))
+        content = entry.get("content", b"")
+        if not filename or not content or not is_supported_image_name(filename):
+            continue
+        try:
+            image = Image.open(io.BytesIO(content)).convert("RGB")
+            stem = Path(filename).stem
+            assets.append(
+                {
+                    "slug": slugify_filename(stem, 0),
+                    "pic_no": normalize_pic_no(stem),
+                    "image": image,
+                }
+            )
+        except Exception:
+            logger.warning("Skipping invalid custom image file: %s", filename)
+
+    for url in parse_image_links(image_links_raw):
+        try:
+            file_name = Path(url.split("?")[0]).name
+            if not is_supported_image_name(file_name):
+                continue
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            stem = Path(url.split("?")[0]).stem or "link-image"
+            assets.append(
+                {
+                    "slug": slugify_filename(stem, 0),
+                    "pic_no": normalize_pic_no(stem),
+                    "image": image,
+                }
+            )
+        except Exception:
+            logger.warning("Skipping invalid custom image URL: %s", url)
+
+    return assets
+
+
+async def build_ai_row_backgrounds(records: List[Dict[str, Any]], session_id: str) -> List[Image.Image]:
+    ai_pool = await build_ai_background_pool(records, session_id)
+
+    return [apply_background_variation(ai_pool[index % len(ai_pool)], index) for index in range(len(records))]
+
+
+def build_custom_row_backgrounds(
+    records: List[Dict[str, Any]],
+    assets: List[Dict[str, Any]],
+    mapping_strategy: str,
+) -> Dict[str, Any]:
+    if not assets:
+        raise HTTPException(status_code=400, detail="Custom mode requires uploaded images or image links.")
+
+    pic_map: Dict[str, Image.Image] = {}
+    for asset in assets:
+        pic_no_key = clean_text(asset.get("pic_no"))
+        if pic_no_key and pic_no_key not in pic_map:
+            pic_map[pic_no_key] = asset["image"]
+
+    row_backgrounds: List[Image.Image] = []
+    matched_records: List[Dict[str, Any]] = []
+    missing_warnings: List[str] = []
+    missing_count = 0
+    matched_count = 0
+
+    for index, row in enumerate(records, start=1):
+        pic_no_key = normalize_pic_no(row.get("PIC NO."))
+        base_image = pic_map.get(pic_no_key) if pic_no_key else None
+
+        if base_image is None:
+            missing_count += 1
+            missing_warnings.append(f"Image not found for PIC NO. {pic_no_key or 'N/A'} (row {index}).")
+            continue
+
+        matched_records.append(row)
+        matched_count += 1
+        row_backgrounds.append(apply_background_variation(base_image, index - 1))
+
+    if not matched_records:
+        raise HTTPException(status_code=400, detail="No custom images matched the provided PIC NO. values.")
+
+    return {
+        "records": matched_records,
+        "backgrounds": row_backgrounds,
+        "matched_count": matched_count,
+        "missing_count": missing_count,
+        "warnings": missing_warnings,
+    }
+
+
+def normalize_header_name(value: Any) -> str:
+    lowered = clean_text(value).lower()
+    return re.sub(r"[^a-z0-9]", "", lowered)
+
+
+def read_tabular_file(file_name: str, file_bytes: bytes, header: int | None) -> pd.DataFrame:
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".csv":
+        try:
+            dataframe = pd.read_csv(io.BytesIO(file_bytes), header=header, dtype=str)
+        except UnicodeDecodeError:
+            dataframe = pd.read_csv(io.BytesIO(file_bytes), header=header, dtype=str, encoding="latin-1")
+    elif suffix == ".xlsx":
+        dataframe = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl", header=header, dtype=str)
+    else:
+        raise HTTPException(status_code=400, detail="Upload must be .xlsx or .csv")
+
+    return dataframe
+
+
+def is_two_section_pin_layout(raw_dataframe: pd.DataFrame) -> bool:
+    if len(raw_dataframe) < 3:
+        return False
+
+    first_row = {
+        normalize_header_name(value)
+        for value in raw_dataframe.iloc[0].tolist()
+        if clean_text(value)
+    }
+    second_row = {
+        normalize_header_name(value)
+        for value in raw_dataframe.iloc[1].tolist()
+        if clean_text(value)
+    }
+
+    return (
+        "pin" in first_row
+        and "pinrestinput" in first_row
+        and "pintitle1stlinebold" in second_row
+        and "pintitle2ndline" in second_row
+    )
+
+
+def parse_two_section_pin_layout(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
+    data = raw_dataframe.iloc[2:].copy().reset_index(drop=True)
+    if data.empty:
+        raise HTTPException(status_code=400, detail="No data rows found in PIN section.")
+
+    def get_column(index: int) -> pd.Series:
+        if index >= data.shape[1]:
+            return pd.Series([""] * len(data))
+        return data.iloc[:, index].fillna("").astype(str).map(clean_text)
+
+    parsed = pd.DataFrame(
+        {
+            "PIN NAME": get_column(0),
+            "Quote": get_column(0),
+            "PINREST INPUT": get_column(2),
+            "Meta Title": get_column(3),
+            "Meta Description": get_column(4),
+            "Hashtags": get_column(5),
+            "TAG TOPIC": get_column(1),
+            "PIN TITLE 2ND LINE": get_column(1),
+            "CREATOR": "",
+            "Timing Link": get_column(6),
+        }
+    )
+
+    parsed = parsed[(parsed["PIN NAME"] != "") & (parsed["Quote"] != "")].reset_index(drop=True)
+    if parsed.empty:
+        raise HTTPException(status_code=400, detail="No valid rows with PIN NAME and Quote found in PIN section.")
+
+    return parsed
+
+
+def is_multi_title_pin_layout(raw_dataframe: pd.DataFrame) -> bool:
+    if len(raw_dataframe) < 3:
+        return False
+
+    first_row = {
+        normalize_header_name(value)
+        for value in raw_dataframe.iloc[0].tolist()
+        if clean_text(value)
+    }
+    second_row = {
+        normalize_header_name(value)
+        for value in raw_dataframe.iloc[1].tolist()
+        if clean_text(value)
+    }
+
+    has_position_markers = bool(first_row.intersection({"top", "center", "bottom"}))
+    has_title_headers = bool(
+        second_row.intersection(
+            {
+                "pintitletop",
+                "pintitlecenter",
+                "pintitlebottom",
+                "pintitletopbold",
+                "pintitlecenterbold",
+                "pintitlebottombold",
+            }
+        )
+    )
+    return has_position_markers and "picno" in second_row and has_title_headers
+
+
+def parse_multi_title_pin_layout(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
+    data = raw_dataframe.iloc[2:].copy().reset_index(drop=True)
+    if data.empty:
+        raise HTTPException(status_code=400, detail="No data rows found in multi-title PIN section.")
+
+    def get_column(index: int) -> pd.Series:
+        if index >= data.shape[1]:
+            return pd.Series([""] * len(data))
+        return data.iloc[:, index].fillna("").astype(str).map(clean_text)
+
+    parsed = pd.DataFrame(
+        {
+            "PIC NO.": get_column(0),
+            "PIN TITLE - TOP": get_column(1),
+            "PIN TITLE - CENTER": get_column(2),
+            "PIN TITLE - BOTTOM": get_column(3),
+            "PIN TITLE 2ND LINE": get_column(4),
+            "PIN NAME": get_column(5),
+            "Quote": get_column(2),
+            "PINREST INPUT": "",
+            "Meta Title": get_column(5),
+            "Meta Description": get_column(2),
+            "Hashtags": "",
+            "TAG TOPIC": "",
+            "CREATOR": "",
+            "Timing Link": "",
+        }
+    )
+
+    for index, row in parsed.iterrows():
+        titles = [
+            clean_text(row.get("PIN TITLE - TOP")),
+            clean_text(row.get("PIN TITLE - CENTER")),
+            clean_text(row.get("PIN TITLE - BOTTOM")),
+        ]
+        primary_quote = next((title for title in titles if title), clean_text(row.get("PIN NAME")))
+        parsed.at[index, "Quote"] = primary_quote
+        if not clean_text(row.get("Meta Title")):
+            parsed.at[index, "Meta Title"] = clean_text(row.get("PIN NAME")) or primary_quote
+
+    parsed = parsed[
+        (parsed["PIN NAME"] != "")
+        & (
+            (parsed["PIN TITLE - TOP"] != "")
+            | (parsed["PIN TITLE - CENTER"] != "")
+            | (parsed["PIN TITLE - BOTTOM"] != "")
+        )
+    ].reset_index(drop=True)
+
+    if parsed.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid rows with PIN NAME and at least one title (top/center/bottom) found.",
+        )
+
+    return parsed
+
+
+def detect_header_row(raw_dataframe: pd.DataFrame) -> int | None:
+    scan_limit = min(len(raw_dataframe), 12)
+    header_vocabulary = set()
+    for aliases in HEADER_ALIASES.values():
+        header_vocabulary.update(aliases)
+
+    best_row = None
+    best_score = -1
+
+    for row_index in range(scan_limit):
+        row_values = {
+            normalize_header_name(value)
+            for value in raw_dataframe.iloc[row_index].tolist()
+            if clean_text(value)
+        }
+        if not row_values:
+            continue
+
+        score = len(row_values.intersection(header_vocabulary))
+        if "quote" in row_values:
+            score += 6
+        if "pinname" in row_values:
+            score += 4
+        has_primary_marker = "pinname" in row_values or "pin" in row_values
+
+        if has_primary_marker and score > best_score:
+            best_score = score
+            best_row = row_index
+
+    return best_row if best_score >= 3 else None
+
+
+def standardize_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    normalized_columns = {
+        normalize_header_name(column): str(column)
+        for column in dataframe.columns
+        if clean_text(column)
+    }
+
+    def resolve_column(canonical_name: str) -> str | None:
+        aliases = HEADER_ALIASES[canonical_name]
+        for alias in aliases:
+            if alias in normalized_columns:
+                return normalized_columns[alias]
+        return None
+
+    resolved_columns: Dict[str, str] = {}
+    missing: List[str] = []
+    for canonical in REQUIRED_COLUMNS:
+        column_name = resolve_column(canonical)
+        if column_name is None:
+            if canonical in MANDATORY_COLUMNS:
+                missing.append(canonical)
+        else:
+            resolved_columns[canonical] = column_name
+
+    if missing:
+        available_headers = [clean_text(column) for column in dataframe.columns if clean_text(column)]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Missing columns: {', '.join(missing)}. "
+                f"Detected headers: {', '.join(available_headers) if available_headers else 'none'}"
+            ),
+        )
+
+    parsed = pd.DataFrame()
+
+    for canonical in REQUIRED_COLUMNS:
+        source_column = resolved_columns.get(canonical)
+        if source_column:
+            parsed[canonical] = dataframe[source_column].fillna("").astype(str).map(clean_text)
+        else:
+            parsed[canonical] = ""
+
+    for canonical in OPTIONAL_COLUMNS:
+        source_column = resolve_column(canonical)
+        if source_column:
+            parsed[canonical] = dataframe[source_column].fillna("").astype(str).map(clean_text)
+        else:
+            parsed[canonical] = ""
+
+    topic_column = resolved_columns.get("TAG TOPIC")
+    tag_column = normalized_columns.get("tag")
+    if topic_column and tag_column and topic_column != tag_column:
+        topic_series = dataframe[topic_column].fillna("").astype(str).map(clean_text)
+        tag_series = dataframe[tag_column].fillna("").astype(str).map(clean_text)
+        parsed["TAG TOPIC"] = topic_series.where(topic_series != "", tag_series)
+
+    link_column = resolved_columns.get("Timing Link")
+    timing_column = normalized_columns.get("timing")
+    if link_column and timing_column and link_column != timing_column:
+        link_series = dataframe[link_column].fillna("").astype(str).map(clean_text)
+        timing_series = dataframe[timing_column].fillna("").astype(str).map(clean_text)
+        parsed["Timing Link"] = link_series.where(link_series != "", timing_series)
+
+    parsed = parsed.replace("nan", "")
+    if parsed["Meta Title"].eq("").all():
+        parsed["Meta Title"] = parsed["PINREST INPUT"].where(parsed["PINREST INPUT"] != "", parsed["PIN NAME"])
+
+    if parsed["Meta Description"].eq("").all():
+        parsed["Meta Description"] = parsed["Quote"]
+
+    if not parsed.empty:
+        first_row_text = " ".join(parsed.iloc[0].astype(str).tolist()).lower()
+        if "pin title" in first_row_text and "pin description" in first_row_text:
+            parsed = parsed.iloc[1:].reset_index(drop=True)
+
+    parsed = parsed[parsed["PIN NAME"] != ""].reset_index(drop=True)
+
+    if parsed.empty:
+        raise HTTPException(status_code=400, detail="No valid rows found after parsing. Please verify your header row.")
+
+    return parsed
+
+
+def parse_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    raw = read_tabular_file(file_name, file_bytes, header=None)
+    if is_multi_title_pin_layout(raw):
+        return parse_multi_title_pin_layout(raw)
+    if is_two_section_pin_layout(raw):
+        return parse_two_section_pin_layout(raw)
+
+    initial = read_tabular_file(file_name, file_bytes, header=0)
+    has_unnamed = any(str(column).lower().startswith("unnamed") for column in initial.columns)
+
+    if has_unnamed:
+        header_row = detect_header_row(raw)
+        if header_row is not None:
+            header_values = [clean_text(value) for value in raw.iloc[header_row].tolist()]
+            rebuilt = raw.iloc[header_row + 1 :].copy().reset_index(drop=True)
+            rebuilt.columns = header_values
+            return standardize_dataframe(rebuilt)
+
+    try:
+        return standardize_dataframe(initial)
+    except HTTPException as first_error:
+        header_row = detect_header_row(raw)
+        if header_row is None:
+            raise first_error
+
+        header_values = [clean_text(value) for value in raw.iloc[header_row].tolist()]
+        rebuilt = raw.iloc[header_row + 1 :].copy().reset_index(drop=True)
+        rebuilt.columns = header_values
+        return standardize_dataframe(rebuilt)
+
+
+def _truetype_font_candidates(bold: bool) -> List[str]:
+    """Linux (Docker), Windows, and macOS paths so we never fall back to tiny bitmap default()."""
+    pil_fonts_dir = Path(ImageFont.__file__).resolve().parent / "fonts"
+    pil_bold = str(pil_fonts_dir / "DejaVuSans-Bold.ttf")
+    pil_regular = str(pil_fonts_dir / "DejaVuSans.ttf")
+    if bold:
+        return [
+            "DejaVuSans-Bold.ttf",
+            "Arial Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            pil_bold,
+            str(ROOT_DIR / "assets" / "fonts" / "DejaVuSans-Bold.ttf"),
+            r"C:\Windows\Fonts\arialbd.ttf",
+            r"C:\Windows\Fonts\ARIALBD.TTF",
+            r"C:\Windows\Fonts\calibrib.ttf",
+            r"C:\Windows\Fonts\CALIBRIB.TTF",
+            r"C:\Windows\Fonts\segoeuib.ttf",
+            r"C:\Windows\Fonts\SegoeUI-Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+    return [
+        "DejaVuSans.ttf",
+        "Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        pil_regular,
+        str(ROOT_DIR / "assets" / "fonts" / "DejaVuSans.ttf"),
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\ARIAL.TTF",
+        r"C:\Windows\Fonts\calibri.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+
+
+def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    size = max(8, int(size))
+    for candidate in _truetype_font_candidates(bold):
+        try:
+            path = Path(candidate)
+            # Try direct file path when present, otherwise let Pillow resolve font names.
+            if path.is_file():
+                return ImageFont.truetype(str(path), size=size)
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.truetype("arial.ttf", size=size)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Pin fonts: no TrueType file found (install fonts or add backend/assets/fonts/DejaVuSans-Bold.ttf); "
+            "Pillow default bitmap font is very small."
+        )
+        # Pillow >=10 supports a size argument; older versions ignore it.
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+
+def get_quote_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Bold sans headline (readable Pinterest-style pins). Script optional via env."""
+    if os.environ.get("QUOTE_FONT_SCRIPT", "").strip().lower() in ("1", "true", "yes"):
+        dancing_script = ROOT_DIR / "assets" / "fonts" / "DancingScript-Bold.ttf"
+        if Path(dancing_script).exists():
+            return ImageFont.truetype(str(dancing_script), size=size)
+    return get_font(size, bold=True)
+
+
+def _load_font_file(path: Path, size: int) -> ImageFont.FreeTypeFont | None:
+    if path.is_file():
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except OSError:
+            return None
+    return None
+
+
+def get_style_font(size: int, style: str) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    style_key = clean_text(style).lower()
+    fonts_dir = ROOT_DIR / "assets" / "fonts"
+
+    if style_key == "italic":
+        cormorant = _load_font_file(fonts_dir / "CormorantGaramond-Italic.ttf", size)
+        if cormorant:
+            return cormorant
+        return get_font(size, bold=False)
+
+    if style_key == "chewy":
+        chewy = _load_font_file(fonts_dir / "Chewy-Regular.ttf", size)
+        if chewy:
+            return chewy
+        return get_font(size, bold=True)
+
+    if style_key == "cursive":
+        dancing_bold = _load_font_file(fonts_dir / "DancingScript-Bold.ttf", size)
+        if dancing_bold:
+            return dancing_bold
+        dancing_reg = _load_font_file(fonts_dir / "DancingScript-Regular.ttf", size)
+        if dancing_reg:
+            return dancing_reg
+        return get_font(size, bold=False)
+
+    return get_font(size, bold=True)
+
+
+def normalize_font_style(value: str, default: str = "bold") -> str:
+    style = clean_text(value).lower()
+    return style if style in VALID_FONT_STYLES else default
+
+
+def parse_font_size_px(value: Any, default: int = 12) -> int:
+    """User-facing size at reference canvas height 1500px; scaled per pin height in scaled_font_size_px."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        base = int(round(float(value)))
+    else:
+        raw = clean_text(str(value)).lower().replace("px", "").strip()
+        if not raw:
+            return default
+        if raw in LEGACY_FONT_SIZE_ALIASES:
+            base = LEGACY_FONT_SIZE_ALIASES[raw]
+        else:
+            try:
+                base = int(round(float(raw)))
+            except ValueError:
+                return default
+    return max(6, min(500, base))
+
+
+def scaled_font_size_px(base_px: int, canvas_height: int) -> int:
+    """Scale reference px so the same number looks proportionally similar on long/big pins."""
+    return max(6, min(500, int(round(base_px * (canvas_height / 1500)))))
+
+
+def resolve_title_slots(title_count: int, title_slots_raw: str) -> List[str]:
+    valid_slots = {"top", "center", "bottom"}
+    if clean_text(title_slots_raw):
+        requested = [
+            slot
+            for slot in (clean_text(part).lower() for part in title_slots_raw.split(","))
+            if slot in valid_slots
+        ]
+        if requested:
+            return requested[: max(1, min(3, title_count))]
+
+    defaults = {
+        1: ["center"],
+        2: ["top", "bottom"],
+        3: ["top", "center", "bottom"],
+    }
+    return defaults.get(max(1, min(3, title_count)), ["top", "center", "bottom"])
+
+
+def build_title_blocks(
+    row: Dict[str, Any],
+    title_count: int,
+    title_slots_raw: str,
+    style_by_slot: Dict[str, str],
+    size_by_slot: Dict[str, int] | None,
+) -> List[Dict[str, Any]]:
+    sizes = size_by_slot or {}
+    slot_text = {
+        "top": clean_text(row.get("PIN TITLE - TOP")),
+        "center": clean_text(row.get("PIN TITLE - CENTER")),
+        "bottom": clean_text(row.get("PIN TITLE - BOTTOM")),
+    }
+    blocks: List[Dict[str, Any]] = []
+    for slot in resolve_title_slots(title_count, title_slots_raw):
+        text = slot_text.get(slot, "")
+        if not text:
+            continue
+        blocks.append(
+            {
+                "text": text,
+                "position": slot,
+                "font_style": normalize_font_style(style_by_slot.get(slot, "bold")),
+                "font_size_px": int(sizes.get(slot, 12)),
+            }
+        )
+    return blocks
+
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> List[str]:
+    words = text.split()
+    if not words:
+        return ["Your quote here"]
+
+    lines: List[str] = []
+    current_line: List[str] = []
+
+    for word in words:
+        test_line = " ".join(current_line + [word])
+        text_box = draw.textbbox((0, 0), test_line, font=font)
+        text_width = text_box[2] - text_box[0]
+
+        if text_width <= max_width or not current_line:
+            current_line.append(word)
+        else:
+            lines.append(" ".join(current_line))
+            current_line = [word]
+
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    return lines
+
+
+def _measure_wrapped_block(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> tuple[List[str], int, int]:
+    lines = wrap_text(draw, text, font, max_width)
+    line_gap = max(14, int(font.size * 0.14)) if hasattr(font, "size") else 18
+    line_heights: List[int] = []
+    for line in lines:
+        bb = draw.textbbox((0, 0), line, font=font)
+        line_heights.append(bb[3] - bb[1])
+    total_height = sum(line_heights) + max(0, len(lines) - 1) * line_gap
+    return lines, total_height, line_gap
+
+
+def _fit_font_for_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    start_size: int,
+    font_style: str,
+    min_size: int = 56,
+    max_lines: int = 5,
+) -> tuple[ImageFont.ImageFont, List[str], int, int]:
+    line_height = start_size
+    selected_font = get_style_font(line_height, font_style)
+    lines, total_height, line_gap = _measure_wrapped_block(draw, text, selected_font, max_width)
+    while (
+        (len(lines) > max_lines or max((len(line) for line in lines), default=0) > 52)
+        and line_height > min_size
+    ):
+        line_height -= 3
+        selected_font = get_style_font(line_height, font_style)
+        lines, total_height, line_gap = _measure_wrapped_block(draw, text, selected_font, max_width)
+    return selected_font, lines, total_height, line_gap
+
+
+def _draw_headline_block(
+    draw: ImageDraw.ImageDraw,
+    lines: List[str],
+    font: ImageFont.ImageFont,
+    canvas_width: int,
+    start_y: int,
+    line_gap: int,
+) -> None:
+    cursor_y = float(start_y)
+    line_height = font.size if hasattr(font, "size") else 96
+    for line in lines:
+        line_box = draw.textbbox((0, 0), line, font=font)
+        line_width = line_box[2] - line_box[0]
+        x = int((canvas_width - line_width) / 2)
+        y = int(cursor_y)
+        for ox, oy in ((6, 6), (5, 5), (4, 4), (3, 3)):
+            draw.text((x + ox, y + oy), line, font=font, fill=(0, 0, 0, 60))
+        draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0, 95))
+        sw = max(2, min(5, line_height // 28))
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=(255, 255, 255, 255),
+            stroke_width=sw,
+            stroke_fill=(255, 255, 255, 255),
+        )
+        cursor_y += (line_box[3] - line_box[1]) + line_gap
+
+
+def render_pin(
+    background: Image.Image,
+    quote: str,
+    text_position: str,
+    bottom_bar_text: str = "",
+    canvas_size: tuple[int, int] = (1000, 1500),
+    title_blocks: List[Dict[str, Any]] | None = None,
+    end_line_font_style: str = "bold",
+    end_line_font_size_px: int = 12,
+    quote_font_size_px: int = 12,
+) -> Image.Image:
+    width, height = canvas_size
+    canvas = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS).convert("RGBA")
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 38))
+    canvas = Image.alpha_composite(canvas, overlay)
+    draw = ImageDraw.Draw(canvas)
+
+    quote_area_width = int(width * 0.88)
+    bar_label = clean_text(bottom_bar_text) or "Tap to learn more"
+    bar_wrap_width = int(width * 0.94)
+
+    headline_blocks: List[Dict[str, Any]] = []
+    if title_blocks:
+        for block in title_blocks:
+            text = clean_text(block.get("text"))
+            if not text:
+                continue
+            ref_px = block.get("font_size_px")
+            if ref_px is None and block.get("font_size") is not None:
+                ref_px = parse_font_size_px(block.get("font_size"), 12)
+            else:
+                ref_px = parse_font_size_px(ref_px, 12)
+            font_size = scaled_font_size_px(int(ref_px), height)
+            font_style = normalize_font_style(block.get("font_style", "bold"))
+            font, lines, total_height, line_gap = _fit_font_for_text(
+                draw,
+                text,
+                quote_area_width,
+                font_size,
+                font_style,
+                min_size=max(6, int(font_size * 0.45)),
+            )
+            headline_blocks.append(
+                {
+                    "position": block.get("position", "center"),
+                    "font": font,
+                    "lines": lines,
+                    "total_height": total_height,
+                    "line_gap": line_gap,
+                }
+            )
+    else:
+        quote_text = clean_text(quote) or "Create your momentum one step at a time"
+        font_size = scaled_font_size_px(parse_font_size_px(quote_font_size_px, 12), height)
+        font, lines, total_height, line_gap = _fit_font_for_text(
+            draw,
+            quote_text,
+            quote_area_width,
+            font_size,
+            "bold",
+            min_size=max(6, int(font_size * 0.45)),
+        )
+        headline_blocks.append(
+            {
+                "position": text_position,
+                "font": font,
+                "lines": lines,
+                "total_height": total_height,
+                "line_gap": line_gap,
+            }
+        )
+
+    bottom_font_size = scaled_font_size_px(parse_font_size_px(end_line_font_size_px, 12), height)
+    bottom_font = get_style_font(bottom_font_size, normalize_font_style(end_line_font_style))
+    bar_lines = wrap_text(draw, bar_label, bottom_font, bar_wrap_width)
+    while len(bar_lines) > 4 and bottom_font_size > 10:
+        bottom_font_size -= 3
+        bottom_font = get_style_font(bottom_font_size, normalize_font_style(end_line_font_style))
+        bar_lines = wrap_text(draw, bar_label, bottom_font, bar_wrap_width)
+
+    line_spacing_bar = 12
+    bar_line_heights: List[int] = []
+    for bl in bar_lines:
+        bb = draw.textbbox((0, 0), bl, font=bottom_font)
+        bar_line_heights.append(bb[3] - bb[1])
+    bar_text_block = sum(bar_line_heights) + (len(bar_lines) - 1) * line_spacing_bar if len(bar_lines) > 1 else sum(bar_line_heights)
+    min_bar = int(height * 0.14)
+    max_bar = int(height * 0.22)
+    bar_height = max(min_bar, min(max_bar, int(bar_text_block + int(height * 0.048))))
+
+    draw.rectangle([(0, height - bar_height), (width, height)], fill=(255, 255, 255, 255))
+
+    scale = height / 1500
+    top_padding = max(int(52 * scale), int(height * 0.045))
+    bottom_title_gap = int(64 * scale)
+    image_bottom = height - bar_height
+
+    for block in headline_blocks:
+        position = block.get("position", "center")
+        block_height = block["total_height"]
+
+        if position == "top":
+            # Anchor from the top edge (not vertically centered in the upper third)
+            start_y = top_padding
+        elif position == "bottom":
+            start_y = image_bottom - block_height - bottom_title_gap
+        else:
+            center_y = int(700 * scale)
+            start_y = int(center_y - (block_height / 2))
+
+        start_y = max(
+            top_padding,
+            min(start_y, image_bottom - block_height - int(40 * scale)),
+        )
+        _draw_headline_block(draw, block["lines"], block["font"], width, start_y, block["line_gap"])
+
+    y_bar_top = height - bar_height
+    cursor_y = y_bar_top + (bar_height - bar_text_block) / 2
+    for idx, bl in enumerate(bar_lines):
+        bb = draw.textbbox((0, 0), bl, font=bottom_font)
+        bw = bb[2] - bb[0]
+        bh = bb[3] - bb[1]
+        bx = (width - bw) / 2
+        by = cursor_y
+        for ox, oy in ((2, 2), (1, 1)):
+            draw.text((bx + ox, by + oy), bl, font=bottom_font, fill=(0, 0, 0, 40))
+        draw.text((bx, by), bl, font=bottom_font, fill=(18, 18, 24))
+        cursor_y += bh + (line_spacing_bar if idx < len(bar_lines) - 1 else 0)
+
+    return canvas.convert("RGB")
+
+
+def make_unique_filename(session_dir: Path, base_slug: str) -> str:
+    candidate = f"{base_slug}.png"
+    counter = 2
+    while (session_dir / candidate).exists():
+        candidate = f"{base_slug}-{counter}.png"
+        counter += 1
+    return candidate
+
+
+def create_pin_payload(
+    row: Dict[str, Any],
+    index: int,
+    session_id: str,
+    session_dir: Path,
+    text_position: str,
+    background_image: Image.Image,
+    generation_mode: str,
+    pin_size_key: str = "standard",
+    title_count: int = 1,
+    title_slots_raw: str = "",
+    style_by_slot: Dict[str, str] | None = None,
+    size_by_slot: Dict[str, int] | None = None,
+    end_line_font_style: str = "bold",
+    end_line_font_size_px: int = 12,
+    quote_font_size_px: int = 12,
+) -> Dict[str, Any]:
+    pin_name = clean_text(row.get("PIN NAME"))
+    pin_title_top = clean_text(row.get("PIN TITLE - TOP"))
+    pin_title_center = clean_text(row.get("PIN TITLE - CENTER"))
+    pin_title_bottom = clean_text(row.get("PIN TITLE - BOTTOM"))
+    quote = clean_text(row.get("Quote")) or pin_title_center or pin_title_top or pin_title_bottom or pin_name
+    pin_title_2nd_line = clean_text(row.get("PIN TITLE 2ND LINE"))
+    prompt = build_ai_prompt(
+        row.get("Meta Title", ""),
+        row.get("Meta Description", ""),
+        row.get("TAG TOPIC", ""),
+    )
+
+    canvas_size = PIN_SIZE_PRESETS.get(pin_size_key, PIN_SIZE_PRESETS["standard"])
+    style_map = style_by_slot or {}
+    size_map = size_by_slot or {}
+    title_blocks = build_title_blocks(row, title_count, title_slots_raw, style_map, size_map)
+    has_split_titles = bool(pin_title_top or pin_title_center or pin_title_bottom)
+
+    rendered = render_pin(
+        background_image,
+        quote,
+        text_position,
+        pin_title_2nd_line,
+        canvas_size=canvas_size,
+        title_blocks=title_blocks if has_split_titles and title_blocks else None,
+        end_line_font_style=end_line_font_style,
+        end_line_font_size_px=end_line_font_size_px,
+        quote_font_size_px=quote_font_size_px,
+    )
+    base_slug = slugify_filename(pin_name or quote, index)
+    file_name = make_unique_filename(session_dir, base_slug)
+    file_path = session_dir / file_name
+    rendered.save(file_path, format="PNG")
+
+    return {
+        "pin_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "pin_name": pin_name,
+        "pic_no": normalize_pic_no(row.get("PIC NO.")),
+        "quote": quote,
+        "pin_title_2nd_line": pin_title_2nd_line,
+        "pin_title_top": pin_title_top,
+        "pin_title_center": pin_title_center,
+        "pin_title_bottom": pin_title_bottom,
+        "pin_size": pin_size_key,
+        "pinrest_input": clean_text(row.get("PINREST INPUT")),
+        "meta_title": clean_text(row.get("Meta Title")),
+        "meta_description": clean_text(row.get("Meta Description")),
+        "hashtags": clean_text(row.get("Hashtags")),
+        "tag_topic": clean_text(row.get("TAG TOPIC")),
+        "creator": clean_text(row.get("CREATOR")),
+        "timing_link": clean_text(row.get("Timing Link")),
+        "ai_prompt": prompt,
+        "mode": generation_mode,
+        "filename": file_name,
+        "image_url": f"/api/static/pins/{session_id}/{file_name}",
+        "file_path": str(file_path),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def to_public_pin(document: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in document.items()
+        if key != "file_path"
+    }
+
+# Add your routes to the router instead of directly to app
+@api_router.get("/")
+async def root():
+    return {"message": "Hello World"}
+
+
+@api_router.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@api_router.post("/status", response_model=StatusCheck)
+async def create_status_check(input: StatusCheckCreate):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database is not configured (MONGO_URL unset).")
+    status_dict = input.model_dump()
+    status_obj = StatusCheck(**status_dict)
+
+    # Convert to dict and serialize datetime to ISO string for MongoDB
+    doc = status_obj.model_dump()
+    doc["timestamp"] = doc["timestamp"].isoformat()
+
+    _ = await db.status_checks.insert_one(doc)
+    return status_obj
+
+
+@api_router.get("/status", response_model=List[StatusCheck])
+async def get_status_checks():
+    if db is None:
+        return []
+    # Exclude MongoDB's _id field from the query results
+    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
+    
+    # Convert ISO string timestamps back to datetime objects
+    for check in status_checks:
+        if isinstance(check['timestamp'], str):
+            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
+    
+    return status_checks
+
+
+@api_router.post("/pins/generate", response_model=GeneratePinsResponse)
+async def generate_pins(
+    data_file: UploadFile = File(...),
+    mode: str = Form("ai"),
+    template_image: UploadFile | None = File(default=None),
+    template_text_position: str = Form("center"),
+    pin_size: str = Form("standard"),
+    title_count: int = Form(3),
+    title_slots: str = Form(""),
+    title_top_font_style: str = Form("bold"),
+    title_center_font_style: str = Form("italic"),
+    title_bottom_font_style: str = Form("bold"),
+    title_top_font_size: str = Form("12"),
+    title_center_font_size: str = Form("12"),
+    title_bottom_font_size: str = Form("12"),
+    end_line_font_style: str = Form("chewy"),
+    end_line_font_size: str = Form("12"),
+    legacy_quote_font_size: str = Form("12"),
+    max_pins: int = Form(50),
+    quotes_file: UploadFile | None = File(default=None),
+    custom_images: List[UploadFile] = File(default=[]),
+    custom_image_zip: UploadFile | None = File(default=None),
+    image_links: str = Form(""),
+    mapping_strategy: str = Form("pin_name_match_then_sequential"),
+):
+    mode = clean_text(mode).lower()
+    if mode not in {"ai", "custom"}:
+        raise HTTPException(status_code=400, detail="mode must be 'ai' or 'custom'")
+
+    if max_pins < 1:
+        raise HTTPException(status_code=400, detail="max_pins must be at least 1")
+
+    if template_text_position not in {"top", "center", "bottom"}:
+        raise HTTPException(status_code=400, detail="template_text_position must be top, center, or bottom")
+
+    pin_size_key = clean_text(pin_size).lower()
+    if pin_size_key not in PIN_SIZE_PRESETS:
+        raise HTTPException(status_code=400, detail="pin_size must be standard, long, or big")
+
+    title_count_value = max(1, min(3, int(title_count)))
+    style_by_slot = {
+        "top": normalize_font_style(title_top_font_style),
+        "center": normalize_font_style(title_center_font_style, "italic"),
+        "bottom": normalize_font_style(title_bottom_font_style),
+    }
+    size_by_slot = {
+        "top": parse_font_size_px(title_top_font_size, 12),
+        "center": parse_font_size_px(title_center_font_size, 12),
+        "bottom": parse_font_size_px(title_bottom_font_size, 12),
+    }
+    end_line_font_size_px = parse_font_size_px(end_line_font_size, 12)
+    quote_font_size_px = parse_font_size_px(legacy_quote_font_size, 12)
+    end_line_style = normalize_font_style(end_line_font_style, "chewy")
+
+    total_limit = min(max_pins, 100)
+    data_file_name = clean_text(data_file.filename)
+    if not data_file_name.lower().endswith((".xlsx", ".csv")):
+        raise HTTPException(
+            status_code=400,
+            detail="Primary metadata file must be .xlsx or .csv. Use quotes_file for .docx uploads.",
+        )
+
+    file_bytes = await data_file.read()
+    dataframe = parse_file(data_file_name, file_bytes)
+
+    if dataframe.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file has no rows")
+
+    dataframe = dataframe.head(total_limit)
+    records = dataframe.to_dict(orient="records")
+    total_rows_processed = len(records)
+
+    if quotes_file is not None and quotes_file.filename:
+        if not quotes_file.filename.lower().endswith(".docx"):
+            raise HTTPException(status_code=400, detail="quotes_file must be a .docx Word document")
+        quote_lines = parse_docx_quotes(await quotes_file.read())
+        for index, row in enumerate(records):
+            if index < len(quote_lines):
+                row["Quote"] = quote_lines[index]
+
+    valid_records: List[Dict[str, Any]] = []
+    skipped_warnings: List[str] = []
+
+    for row_index, row in enumerate(records, start=1):
+        pin_name_value = clean_text(row.get("PIN NAME"))
+        quote_value = clean_text(row.get("Quote"))
+        pic_no_value = normalize_pic_no(row.get("PIC NO."))
+
+        if mode == "custom" and not pic_no_value:
+            skipped_warnings.append(f"Skipped row {row_index}: missing or invalid PIC NO.")
+            continue
+
+        title_top_value = clean_text(row.get("PIN TITLE - TOP"))
+        title_center_value = clean_text(row.get("PIN TITLE - CENTER"))
+        title_bottom_value = clean_text(row.get("PIN TITLE - BOTTOM"))
+        has_title_text = bool(title_top_value or title_center_value or title_bottom_value or quote_value)
+
+        if not pin_name_value or not has_title_text:
+            skipped_warnings.append(
+                f"Skipped row {row_index}: missing {'PIN NAME' if not pin_name_value else ''}"
+                f"{' and ' if (not pin_name_value and not has_title_text) else ''}"
+                f"{'title/quote text' if not has_title_text else ''}."
+            )
+            continue
+
+        if not quote_value:
+            quote_value = title_center_value or title_top_value or title_bottom_value or pin_name_value
+
+        row["PIN NAME"] = pin_name_value
+        row["Quote"] = quote_value
+        row["PIC NO."] = pic_no_value
+        valid_records.append(row)
+
+    if not valid_records:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid rows found with PIN NAME and at least one title or quote.",
+        )
+
+    records = valid_records
+
+    session_id = str(uuid.uuid4())
+    session_dir = GENERATED_PINS_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    mode_used = mode
+    auto_switched = False
+    switch_message = ""
+
+    template_obj = None
+    if template_image is not None and template_image.filename:
+        template_bytes = await template_image.read()
+        try:
+            template_obj = Image.open(io.BytesIO(template_bytes)).convert("RGB")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid template image") from exc
+
+    custom_file_entries: List[Dict[str, Any]] = []
+    for uploaded_image in custom_images or []:
+        if uploaded_image and uploaded_image.filename:
+            custom_file_entries.append(
+                {
+                    "filename": uploaded_image.filename,
+                    "content": await uploaded_image.read(),
+                }
+            )
+
+    if custom_image_zip is not None and custom_image_zip.filename:
+        if not custom_image_zip.filename.lower().endswith(".zip"):
+            raise HTTPException(status_code=400, detail="custom_image_zip must be a .zip file")
+        zip_entries = extract_zip_image_entries(await custom_image_zip.read())
+        custom_file_entries.extend(zip_entries)
+
+    custom_assets: List[Dict[str, Any]] = []
+    if custom_file_entries or clean_text(image_links):
+        custom_assets = await asyncio.to_thread(load_custom_image_assets, custom_file_entries, image_links)
+
+    if template_obj is not None:
+        row_backgrounds = [template_obj.copy() for _ in records]
+        images_matched = len(records)
+        missing_images_count = 0
+    else:
+        if mode == "custom":
+            custom_result = await asyncio.to_thread(
+                build_custom_row_backgrounds,
+                records,
+                custom_assets,
+                mapping_strategy,
+            )
+            records = custom_result["records"]
+            row_backgrounds = custom_result["backgrounds"]
+            images_matched = custom_result["matched_count"]
+            missing_images_count = custom_result["missing_count"]
+            skipped_warnings.extend(custom_result["warnings"])
+        else:
+            try:
+                row_backgrounds = await build_ai_row_backgrounds(records, session_id)
+                images_matched = len(records)
+                missing_images_count = 0
+            except AIQuotaExceededError:
+                if custom_assets:
+                    custom_result = await asyncio.to_thread(
+                        build_custom_row_backgrounds,
+                        records,
+                        custom_assets,
+                        mapping_strategy,
+                    )
+                    records = custom_result["records"]
+                    row_backgrounds = custom_result["backgrounds"]
+                    images_matched = custom_result["matched_count"]
+                    missing_images_count = custom_result["missing_count"]
+                    skipped_warnings.extend(custom_result["warnings"])
+                    mode_used = "custom"
+                    auto_switched = True
+                    switch_message = (
+                        "Gemini quota/rate limit hit. We automatically switched to Custom mode "
+                        "using your uploaded custom images/links."
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Gemini quota/rate limit reached and no custom images/links were provided "
+                            "for auto-switch. Upload custom assets and retry."
+                        ),
+                    )
+            except AIImageGenerationError as exc:
+                if custom_assets:
+                    custom_result = await asyncio.to_thread(
+                        build_custom_row_backgrounds,
+                        records,
+                        custom_assets,
+                        mapping_strategy,
+                    )
+                    records = custom_result["records"]
+                    row_backgrounds = custom_result["backgrounds"]
+                    images_matched = custom_result["matched_count"]
+                    missing_images_count = custom_result["missing_count"]
+                    skipped_warnings.extend(custom_result["warnings"])
+                    mode_used = "custom"
+                    auto_switched = True
+                    switch_message = (
+                        "Gemini image generation is currently unavailable. "
+                        "We automatically switched to Custom mode using your uploaded images/links."
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"AI image generation failed: {clean_text(exc)[:220]}",
+                    ) from exc
+
+    generation_progress = {
+        "generated_count": 0,
+        "total_count": len(records),
+        "completed": False,
+    }
+    GENERATION_TRACKER[session_id] = generation_progress
+    progress_lock = asyncio.Lock()
+
+    semaphore = asyncio.Semaphore(10)
+
+    async def process_row(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
+        async with semaphore:
+            pin = await asyncio.to_thread(
+                create_pin_payload,
+                row,
+                index,
+                session_id,
+                session_dir,
+                template_text_position,
+                row_backgrounds[index].copy(),
+                mode_used,
+                pin_size_key,
+                title_count_value,
+                title_slots,
+                style_by_slot,
+                size_by_slot,
+                end_line_style,
+                end_line_font_size_px,
+                quote_font_size_px,
+            )
+            async with progress_lock:
+                generation_progress["generated_count"] += 1
+            return pin
+
+    tasks = [process_row(index, row) for index, row in enumerate(records)]
+    generated = await asyncio.gather(*tasks)
+    generation_progress["completed"] = True
+
+    pin_docs = [dict(pin) for pin in generated]
+    if db is not None:
+        await db.pin_records.insert_many(pin_docs)
+        await db.generation_sessions.update_one(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "session_id": session_id,
+                    "generated_count": len(generated),
+                    "completed": True,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+    else:
+        await _remember_ephemeral_session(session_id, pin_docs)
+
+    GENERATION_TRACKER.pop(session_id, None)
+
+    return {
+        "session_id": session_id,
+        "total_generated": len(generated),
+        "skipped_rows": len(skipped_warnings),
+        "warnings": skipped_warnings[:50],
+        "mode_used": mode_used,
+        "auto_switched": auto_switched,
+        "switch_message": switch_message,
+        "total_rows_processed": total_rows_processed,
+        "images_matched": images_matched,
+        "missing_images_count": missing_images_count,
+        "pins": [to_public_pin(pin) for pin in generated],
+    }
+
+
+@api_router.get("/pins/{session_id}", response_model=List[PinRecord])
+async def get_generated_pins(session_id: str):
+    if db is not None:
+        pins = await db.pin_records.find(
+            {"session_id": session_id}, {"_id": 0, "file_path": 0}
+        ).to_list(length=2000)
+        return pins
+    async with _EPHEMERAL_LOCK:
+        raw = _EPHEMERAL_PINS_BY_SESSION.get(session_id, [])
+    return [to_public_pin(p) for p in raw]
+
+
+@api_router.get("/pins/progress/{session_id}", response_model=GenerationSummary)
+async def get_generation_progress(session_id: str):
+    live_progress = GENERATION_TRACKER.get(session_id)
+    if live_progress:
+        return {
+            "generated_count": int(live_progress.get("generated_count", 0)),
+            "completed": bool(live_progress.get("completed", False)),
+        }
+
+    if db is not None:
+        session = await db.generation_sessions.find_one({"session_id": session_id}, {"_id": 0})
+        if session:
+            return {
+                "generated_count": int(session.get("generated_count", 0)),
+                "completed": bool(session.get("completed", False)),
+            }
+    async with _EPHEMERAL_LOCK:
+        ephemeral = _EPHEMERAL_PINS_BY_SESSION.get(session_id)
+    if ephemeral is not None:
+        return {"generated_count": len(ephemeral), "completed": True}
+    raise HTTPException(status_code=404, detail="Session not found")
+
+
+@api_router.get("/pins/download/{pin_id}")
+async def download_pin(pin_id: str):
+    if db is not None:
+        document = await db.pin_records.find_one({"pin_id": pin_id}, {"_id": 0})
+    else:
+        async with _EPHEMERAL_LOCK:
+            document = _EPHEMERAL_PIN_BY_ID.get(pin_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Pin not found")
+
+    file_path = Path(document["file_path"])
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Pin file missing")
+
+    return FileResponse(path=file_path, media_type="image/png", filename=document["filename"])
+
+
+@api_router.get("/pins/download-all/{session_id}")
+async def download_all_pins(session_id: str):
+    if db is not None:
+        documents = await db.pin_records.find({"session_id": session_id}, {"_id": 0}).to_list(length=2000)
+    else:
+        async with _EPHEMERAL_LOCK:
+            documents = list(_EPHEMERAL_PINS_BY_SESSION.get(session_id, []))
+    if not documents:
+        raise HTTPException(status_code=404, detail="No pins found for this session")
+
+    zip_path = GENERATED_PINS_DIR / session_id / f"{session_id}-pins.zip"
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for document in documents:
+            file_path = Path(document["file_path"])
+            if file_path.exists():
+                archive.write(file_path, arcname=document["filename"])
+
+    return FileResponse(path=zip_path, media_type="application/zip", filename=f"{session_id}-pins.zip")
+
+
+@api_router.get("/pins/export/{session_id}")
+async def export_metadata(session_id: str, export_format: str = "csv"):
+    if db is not None:
+        documents = await db.pin_records.find(
+            {"session_id": session_id},
+            {"_id": 0, "file_path": 0},
+        ).to_list(length=2000)
+    else:
+        async with _EPHEMERAL_LOCK:
+            raw = _EPHEMERAL_PINS_BY_SESSION.get(session_id, [])
+        documents = [to_public_pin(p) for p in raw]
+
+    if not documents:
+        raise HTTPException(status_code=404, detail="No metadata found for this session")
+
+    export_format = export_format.lower()
+    target_dir = GENERATED_PINS_DIR / session_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if export_format == "json":
+        output_path = target_dir / f"{session_id}-metadata.json"
+        with output_path.open("w", encoding="utf-8") as json_file:
+            json.dump(documents, json_file, ensure_ascii=False, indent=2)
+        media_type = "application/json"
+    else:
+        output_path = target_dir / f"{session_id}-metadata.csv"
+        dataframe = pd.DataFrame(documents)
+        dataframe.to_csv(output_path, index=False)
+        media_type = "text/csv"
+
+    return FileResponse(path=output_path, media_type=media_type, filename=output_path.name)
+
+# Include the router in the main app
+app.include_router(api_router)
+
+_frontend_static = os.environ.get("FRONTEND_STATIC_DIR", "").strip()
+if _frontend_static:
+    _static_path = Path(_frontend_static).resolve()
+    if _static_path.is_dir():
+        app.mount("/", StaticFiles(directory=str(_static_path), html=True), name="frontend")
+
+_cors_raw = os.environ.get("CORS_ORIGINS", "*").strip()
+_cors_origins = (
+    ["*"]
+    if _cors_raw == "*"
+    else [o.strip() for o in _cors_raw.split(",") if o.strip()]
+)
+# Browsers reject Allow-Credentials: true with Allow-Origin: * — use explicit origins for split deploy.
+_cors_credentials = "*" not in _cors_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=_cors_credentials,
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    if client is not None:
+        client.close()

@@ -1,0 +1,21 @@
+# API only (split deploy: Vercel/Netlify serves the React app, this serves /api only).
+# docker build -f Dockerfile.api -t pinterest-api .
+
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libjq-dev \
+    libonig-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONUNBUFFERED=1
+COPY backend/requirements.txt .
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
+COPY backend/ .
+WORKDIR /app
+EXPOSE 8000
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]

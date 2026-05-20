@@ -1,0 +1,825 @@
+import { useMemo, useState } from "react";
+import axios from "axios";
+import { Download, FileSpreadsheet, ImagePlus, Moon, Sparkles, Sun, WandSparkles, Images } from "lucide-react";
+import { Toaster, toast } from "sonner";
+import "@/App.css";
+import PinCard from "@/components/PinCard";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+/** Empty string = same origin (Docker / single-service deploy). Set full URL when API is on another host. */
+const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL ?? "").replace(/\/$/, "");
+const API = BACKEND_URL ? `${BACKEND_URL}/api` : "/api";
+
+const textPositionOptions = ["top", "center", "bottom"];
+const batchSizeOptions = ["50", "100"];
+const pinSizeOptions = [
+  { value: "standard", label: "Standard (1000×1500)" },
+  { value: "long", label: "Long (1000×2100)" },
+  { value: "big", label: "Big Pins (1200×2520)" },
+];
+const titleCountOptions = ["1", "2", "3"];
+const titleSlotOptions = ["top", "center", "bottom"];
+const fontStyleOptions = [
+  { value: "italic", label: "Italic (Cormorant Garamond)" },
+  { value: "bold", label: "Bold" },
+  { value: "chewy", label: "Chewy" },
+  { value: "cursive", label: "Cursive (Dancing Script)" },
+];
+
+const clampFontSizeInput = (raw) => {
+  const trimmed = String(raw ?? "").trim();
+  if (trimmed === "") return "12";
+  const n = Number.parseInt(trimmed, 10);
+  if (Number.isNaN(n)) return "12";
+  return String(Math.min(500, Math.max(6, n)));
+};
+
+const defaultSlotsForCount = (count) => {
+  if (count === "1") return ["center"];
+  if (count === "2") return ["top", "bottom"];
+  return ["top", "center", "bottom"];
+};
+
+function App() {
+  const [excelFile, setExcelFile] = useState(null);
+  const [wordFile, setWordFile] = useState(null);
+  const [templateFile, setTemplateFile] = useState(null);
+  const [mode, setMode] = useState("ai");
+  const [customImageFiles, setCustomImageFiles] = useState([]);
+  const [customZipFile, setCustomZipFile] = useState(null);
+  const [imageLinks, setImageLinks] = useState("");
+  const [textPosition, setTextPosition] = useState("center");
+  const [pinSize, setPinSize] = useState("long");
+  const [titleCount, setTitleCount] = useState("3");
+  const [selectedTitleSlots, setSelectedTitleSlots] = useState(defaultSlotsForCount("3"));
+  const [titleTopFontStyle, setTitleTopFontStyle] = useState("bold");
+  const [titleCenterFontStyle, setTitleCenterFontStyle] = useState("italic");
+  const [titleBottomFontStyle, setTitleBottomFontStyle] = useState("bold");
+  const [titleTopFontSize, setTitleTopFontSize] = useState("12");
+  const [titleCenterFontSize, setTitleCenterFontSize] = useState("12");
+  const [titleBottomFontSize, setTitleBottomFontSize] = useState("12");
+  const [endLineFontStyle, setEndLineFontStyle] = useState("chewy");
+  const [endLineFontSize, setEndLineFontSize] = useState("12");
+  const [legacyQuoteFontSize, setLegacyQuoteFontSize] = useState("12");
+  const [batchSize, setBatchSize] = useState("50");
+  const [progressValue, setProgressValue] = useState(0);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [pins, setPins] = useState([]);
+  const [sessionId, setSessionId] = useState("");
+  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [showSwitchModal, setShowSwitchModal] = useState(false);
+  const [switchModalMessage, setSwitchModalMessage] = useState("");
+  const [skippedWarnings, setSkippedWarnings] = useState([]);
+  const [mappingStats, setMappingStats] = useState({
+    total_rows_processed: 0,
+    images_matched: 0,
+    missing_images_count: 0,
+  });
+
+  const generatedCount = useMemo(() => pins.length, [pins]);
+
+  const handleTitleCountChange = (value) => {
+    setTitleCount(value);
+    setSelectedTitleSlots(defaultSlotsForCount(value));
+  };
+
+  const toggleTitleSlot = (slot) => {
+    const maxSlots = Number(titleCount);
+    setSelectedTitleSlots((current) => {
+      if (current.includes(slot)) {
+        if (current.length <= 1) return current;
+        return current.filter((item) => item !== slot);
+      }
+      if (current.length >= maxSlots) {
+        return [...current.slice(1), slot];
+      }
+      return [...current, slot];
+    });
+  };
+
+  const getFilenameFromHeaders = (headers, fallback) => {
+    const disposition = headers?.["content-disposition"] || "";
+    const standardMatch = disposition.match(/filename="?([^";]+)"?/i);
+    return standardMatch?.[1] || fallback;
+  };
+
+  const downloadBlobFromApi = async (url, fallbackName) => {
+    const response = await axios.get(url, { responseType: "blob" });
+    const filename = getFilenameFromHeaders(response.headers, fallbackName);
+    const objectUrl = window.URL.createObjectURL(new Blob([response.data]));
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.URL.revokeObjectURL(objectUrl);
+  };
+
+  const toggleTheme = () => {
+    const updated = !isDarkMode;
+    setIsDarkMode(updated);
+    document.documentElement.classList.toggle("dark", updated);
+  };
+
+  const handleGenerate = async () => {
+    if (!excelFile) {
+      toast.error("Please upload your Excel or CSV metadata file first.");
+      return;
+    }
+
+    if (
+      mode === "custom" &&
+      !templateFile &&
+      customImageFiles.length === 0 &&
+      !customZipFile &&
+      !imageLinks.trim()
+    ) {
+      toast.error("Custom mode needs uploaded images, image links, or a template.");
+      return;
+    }
+
+    let generationSucceeded = false;
+    let progressTimer = null;
+    try {
+      setIsGenerating(true);
+      setProgressValue(5);
+      progressTimer = setInterval(() => {
+        setProgressValue((current) => (current < 92 ? current + 6 : current));
+      }, 350);
+
+      const formData = new FormData();
+      formData.append("data_file", excelFile);
+      if (templateFile) {
+        formData.append("template_image", templateFile);
+      }
+      if (wordFile) {
+        formData.append("quotes_file", wordFile);
+      }
+
+      customImageFiles.forEach((file) => {
+        formData.append("custom_images", file);
+      });
+      if (customZipFile) {
+        formData.append("custom_image_zip", customZipFile);
+      }
+
+      formData.append("mode", mode);
+      formData.append("image_links", imageLinks);
+      formData.append("mapping_strategy", "pin_name_match_then_sequential");
+      formData.append("template_text_position", textPosition);
+      formData.append("pin_size", pinSize);
+      formData.append("title_count", titleCount);
+      formData.append("title_slots", selectedTitleSlots.join(","));
+      formData.append("title_top_font_style", titleTopFontStyle);
+      formData.append("title_center_font_style", titleCenterFontStyle);
+      formData.append("title_bottom_font_style", titleBottomFontStyle);
+      formData.append("title_top_font_size", clampFontSizeInput(titleTopFontSize));
+      formData.append("title_center_font_size", clampFontSizeInput(titleCenterFontSize));
+      formData.append("title_bottom_font_size", clampFontSizeInput(titleBottomFontSize));
+      formData.append("end_line_font_style", endLineFontStyle);
+      formData.append("end_line_font_size", clampFontSizeInput(endLineFontSize));
+      formData.append("legacy_quote_font_size", clampFontSizeInput(legacyQuoteFontSize));
+      formData.append("max_pins", batchSize);
+
+      const response = await axios.post(`${API}/pins/generate`, formData, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      });
+
+      clearInterval(progressTimer);
+      setProgressValue(100);
+      setPins(response.data.pins || []);
+      setSessionId(response.data.session_id || "");
+      setSkippedWarnings(response.data.warnings || []);
+      setMappingStats({
+        total_rows_processed: response.data.total_rows_processed || 0,
+        images_matched: response.data.images_matched || 0,
+        missing_images_count: response.data.missing_images_count || 0,
+      });
+      generationSucceeded = true;
+      toast.success(`Generated ${response.data.total_generated} Pinterest pins successfully.`);
+
+      if (response.data.auto_switched) {
+        const switchMessage = response.data.switch_message || "AI quota issue detected. Switched to Custom mode.";
+        setMode(response.data.mode_used || "custom");
+        setSwitchModalMessage(switchMessage);
+        setShowSwitchModal(true);
+        toast.warning("AI quota issue detected. Switched to Custom mode automatically.");
+      }
+
+      if (response.data.skipped_rows > 0) {
+        toast.warning(`Skipped ${response.data.skipped_rows} row(s) missing PIN NAME or Quote.`);
+      }
+    } catch (error) {
+      const message = error?.response?.data?.detail || "Pin generation failed. Please check your file format.";
+      setProgressValue(0);
+      toast.error(message);
+
+       if (mode === "ai" && message.toLowerCase().includes("quota")) {
+        setSwitchModalMessage(
+          `${message} Upload custom images/links and retry so we can auto-switch instantly.`
+        );
+        setShowSwitchModal(true);
+      }
+    } finally {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+      }
+      setIsGenerating(false);
+      if (!generationSucceeded) {
+        setPins([]);
+        setSessionId("");
+        setSkippedWarnings([]);
+        setMappingStats({
+          total_rows_processed: 0,
+          images_matched: 0,
+          missing_images_count: 0,
+        });
+      }
+    }
+  };
+
+  const handleDownloadSingle = async (pin) => {
+    try {
+      await downloadBlobFromApi(`${API}/pins/download/${pin.pin_id}`, pin.filename || `${pin.pin_id}.png`);
+      toast.success(`Downloaded ${pin.filename || "pin"}`);
+    } catch (error) {
+      toast.error("Single download failed. Please try again.");
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    if (!sessionId) {
+      toast.error("Generate pins first to enable ZIP download.");
+      return;
+    }
+    try {
+      await downloadBlobFromApi(`${API}/pins/download-all/${sessionId}`, `${sessionId}-pins.zip`);
+      toast.success("ZIP download started.");
+    } catch (error) {
+      toast.error("ZIP download failed. Please try again.");
+    }
+  };
+
+  const handleExportMetadata = async (exportFormat) => {
+    if (!sessionId) {
+      toast.error("Generate pins first to export metadata.");
+      return;
+    }
+    try {
+      await downloadBlobFromApi(
+        `${API}/pins/export/${sessionId}?export_format=${exportFormat}`,
+        `${sessionId}-metadata.${exportFormat}`
+      );
+      toast.success(`Metadata ${exportFormat.toUpperCase()} downloaded.`);
+    } catch (error) {
+      toast.error(`Metadata ${exportFormat.toUpperCase()} download failed.`);
+    }
+  };
+
+  return (
+    <div
+      className="min-h-screen bg-gradient-to-br from-red-50 via-white to-slate-50 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950"
+      data-testid="pin-generator-app"
+    >
+      <Toaster richColors position="top-right" />
+      <main className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-4 py-10 lg:px-8">
+        <Dialog open={showSwitchModal} onOpenChange={setShowSwitchModal}>
+          <DialogContent data-testid="quota-switch-modal">
+            <DialogHeader>
+              <DialogTitle data-testid="quota-switch-modal-title">Generation Mode Auto-Switched</DialogTitle>
+              <DialogDescription data-testid="quota-switch-modal-message">
+                {switchModalMessage}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button onClick={() => setShowSwitchModal(false)} data-testid="quota-switch-modal-close-button">
+                Got it
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <header className="rounded-3xl border border-red-100 bg-white/80 p-6 shadow-[0_15px_40px_rgba(239,68,68,0.08)] backdrop-blur dark:border-slate-700 dark:bg-slate-900/80 dark:shadow-[0_15px_40px_rgba(2,6,23,0.45)]">
+          <div className="flex flex-wrap items-start justify-between gap-5">
+            <div className="space-y-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-red-600 dark:text-red-400" data-testid="header-kicker-text">
+                Pinterest Affiliate Workflow
+              </p>
+              <h1 className="heading-font text-4xl font-bold leading-tight text-slate-900 sm:text-5xl lg:text-6xl dark:text-slate-100" data-testid="app-main-heading">
+                Bulk Pin Creator Studio
+              </h1>
+              <p className="max-w-2xl text-sm text-slate-600 sm:text-base dark:text-slate-300" data-testid="app-subheading-text">
+                Long & Big pin sizes, multi-title Excel (top/center/bottom), per-title fonts, and 50/100 batch export.
+              </p>
+            </div>
+            <Button
+              onClick={toggleTheme}
+              variant="outline"
+              className="rounded-full border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+              data-testid="theme-toggle-button"
+            >
+              {isDarkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              {isDarkMode ? "Light" : "Dark"} Mode
+            </Button>
+          </div>
+        </header>
+
+        <section className="grid gap-8 lg:grid-cols-[380px_1fr]" data-testid="dashboard-main-grid">
+          <Card className="h-fit rounded-3xl border border-slate-200 bg-white/90 shadow-[0_8px_32px_rgba(15,23,42,0.1)] dark:border-slate-700 dark:bg-slate-900/90">
+            <CardHeader>
+              <CardTitle className="heading-font text-2xl text-slate-900 dark:text-slate-100" data-testid="upload-panel-title">
+                Upload & Generate
+              </CardTitle>
+              <CardDescription data-testid="upload-panel-description">
+                Pick AI mode or Custom mode, then upload metadata and assets.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="space-y-2">
+                <Label data-testid="mode-selector-label">Generation mode</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    variant={mode === "ai" ? "default" : "outline"}
+                    className={mode === "ai" ? "rounded-full bg-[#E60023] text-white" : "rounded-full"}
+                    onClick={() => setMode("ai")}
+                    data-testid="mode-ai-button"
+                  >
+                    <WandSparkles className="h-4 w-4" />
+                    AI Pins
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={mode === "custom" ? "default" : "outline"}
+                    className={mode === "custom" ? "rounded-full bg-[#E60023] text-white" : "rounded-full"}
+                    onClick={() => setMode("custom")}
+                    data-testid="mode-custom-button"
+                  >
+                    <Images className="h-4 w-4" />
+                    Custom Pins
+                  </Button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="excel-file" data-testid="excel-upload-label">Metadata Excel / CSV</Label>
+                <Input
+                  id="excel-file"
+                  type="file"
+                  accept=".xlsx,.csv"
+                  onChange={(event) => setExcelFile(event.target.files?.[0] || null)}
+                  data-testid="excel-upload-input"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="word-file" data-testid="word-upload-label">Word quotes file (optional .docx)</Label>
+                <Input
+                  id="word-file"
+                  type="file"
+                  accept=".docx"
+                  onChange={(event) => setWordFile(event.target.files?.[0] || null)}
+                  data-testid="word-upload-input"
+                />
+              </div>
+
+              {mode === "custom" ? (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="custom-image-zip" data-testid="custom-image-zip-label">Custom images ZIP (optional)</Label>
+                    <Input
+                      id="custom-image-zip"
+                      type="file"
+                      accept=".zip"
+                      onChange={(event) => setCustomZipFile(event.target.files?.[0] || null)}
+                      data-testid="custom-image-zip-input"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="custom-images" data-testid="custom-images-upload-label">Custom images upload</Label>
+                    <Input
+                      id="custom-images"
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      webkitdirectory="true"
+                      onChange={(event) => setCustomImageFiles(Array.from(event.target.files || []))}
+                      data-testid="custom-images-upload-input"
+                    />
+                    <p className="text-xs text-slate-500 dark:text-slate-300" data-testid="custom-mapping-hint-text">
+                      Mapping uses PIC NO. only (e.g. row PIC NO. 5 matches 5.jpg/png/webp).
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="image-links" data-testid="image-links-label">Image links (optional, one per line)</Label>
+                    <Textarea
+                      id="image-links"
+                      value={imageLinks}
+                      onChange={(event) => setImageLinks(event.target.value)}
+                      className="min-h-24"
+                      placeholder="https://..."
+                      data-testid="image-links-textarea"
+                    />
+                  </div>
+                </>
+              ) : null}
+
+              <div className="space-y-2">
+                <Label htmlFor="template-file" data-testid="template-upload-label">Template image (optional)</Label>
+                <Input
+                  id="template-file"
+                  type="file"
+                  accept="image/*"
+                  onChange={(event) => setTemplateFile(event.target.files?.[0] || null)}
+                  data-testid="template-upload-input"
+                />
+                {templateFile ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-8 px-0 text-xs text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                    onClick={() => setTemplateFile(null)}
+                    data-testid="template-clear-button"
+                  >
+                    Remove template and use AI backgrounds
+                  </Button>
+                ) : null}
+              </div>
+
+              <div className="space-y-2">
+                <Label data-testid="pin-size-label">Pin size</Label>
+                <Select value={pinSize} onValueChange={setPinSize}>
+                  <SelectTrigger className="bg-white dark:bg-slate-900" data-testid="pin-size-select-trigger">
+                    <SelectValue placeholder="Select pin size" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {pinSizeOptions.map((option) => (
+                      <SelectItem
+                        key={option.value}
+                        value={option.value}
+                        data-testid={`pin-size-select-option-${option.value}`}
+                      >
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-3 rounded-2xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-700 dark:bg-slate-800/50">
+                <div>
+                  <Label data-testid="title-count-label">Titles on pin</Label>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Excel: top, center, bottom columns. End line stays on the white bar. Font sizes are in pixels at
+                    standard pin height (1500px); they scale up proportionally on long and big pins.
+                  </p>
+                </div>
+                <Select value={titleCount} onValueChange={handleTitleCountChange}>
+                  <SelectTrigger className="bg-white dark:bg-slate-900" data-testid="title-count-select-trigger">
+                    <SelectValue placeholder="How many titles" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {titleCountOptions.map((option) => (
+                      <SelectItem key={option} value={option} data-testid={`title-count-option-${option}`}>
+                        {option === "3" ? "All 3 titles" : `${option} title${option === "1" ? "" : "s"}`}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                {titleCount !== "3" ? (
+                  <div className="space-y-2">
+                    <Label className="text-xs">Which positions</Label>
+                    <div className="flex flex-wrap gap-2">
+                      {titleSlotOptions.map((slot) => (
+                        <Button
+                          key={slot}
+                          type="button"
+                          size="sm"
+                          variant={selectedTitleSlots.includes(slot) ? "default" : "outline"}
+                          className={
+                            selectedTitleSlots.includes(slot)
+                              ? "rounded-full bg-[#E60023] text-white"
+                              : "rounded-full"
+                          }
+                          onClick={() => toggleTitleSlot(slot)}
+                          data-testid={`title-slot-toggle-${slot}`}
+                        >
+                          {slot.charAt(0).toUpperCase() + slot.slice(1)}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {["top", "center", "bottom"].map((slot) => (
+                  <div key={slot} className="grid gap-2 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <Label className="text-xs capitalize">{slot} font style</Label>
+                      <Select
+                        value={
+                          slot === "top"
+                            ? titleTopFontStyle
+                            : slot === "center"
+                              ? titleCenterFontStyle
+                              : titleBottomFontStyle
+                        }
+                        onValueChange={
+                          slot === "top"
+                            ? setTitleTopFontStyle
+                            : slot === "center"
+                              ? setTitleCenterFontStyle
+                              : setTitleBottomFontStyle
+                        }
+                      >
+                        <SelectTrigger className="h-9 bg-white dark:bg-slate-900">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {fontStyleOptions.map((opt) => (
+                            <SelectItem key={`${slot}-style-${opt.value}`} value={opt.value}>
+                              {opt.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs capitalize">{slot} font size (px)</Label>
+                      <Input
+                        type="number"
+                        min={6}
+                        max={500}
+                        className="h-9 bg-white dark:bg-slate-900"
+                        data-testid={`title-${slot}-font-size-input`}
+                        value={slot === "top" ? titleTopFontSize : slot === "center" ? titleCenterFontSize : titleBottomFontSize}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (slot === "top") setTitleTopFontSize(v);
+                          else if (slot === "center") setTitleCenterFontSize(v);
+                          else setTitleBottomFontSize(v);
+                        }}
+                        onBlur={() => {
+                          if (slot === "top") setTitleTopFontSize((s) => clampFontSizeInput(s));
+                          else if (slot === "center") setTitleCenterFontSize((s) => clampFontSizeInput(s));
+                          else setTitleBottomFontSize((s) => clampFontSizeInput(s));
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+
+                <div className="grid gap-2 sm:grid-cols-2 border-t border-slate-200 pt-3 dark:border-slate-600">
+                  <div className="space-y-1">
+                    <Label className="text-xs">End line font style</Label>
+                    <Select value={endLineFontStyle} onValueChange={setEndLineFontStyle}>
+                      <SelectTrigger className="h-9 bg-white dark:bg-slate-900" data-testid="end-line-font-style-select">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {fontStyleOptions.map((opt) => (
+                          <SelectItem key={`end-style-${opt.value}`} value={opt.value}>
+                            {opt.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">End line font size (px)</Label>
+                    <Input
+                      type="number"
+                      min={6}
+                      max={500}
+                      className="h-9 bg-white dark:bg-slate-900"
+                      data-testid="end-line-font-size-input"
+                      value={endLineFontSize}
+                      onChange={(e) => setEndLineFontSize(e.target.value)}
+                      onBlur={() => setEndLineFontSize((s) => clampFontSizeInput(s))}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label data-testid="text-position-label">Template quote position (legacy sheets)</Label>
+                <Select value={textPosition} onValueChange={setTextPosition}>
+                  <SelectTrigger className="bg-white dark:bg-slate-900" data-testid="text-position-select-trigger">
+                    <SelectValue placeholder="Select text position" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {textPositionOptions.map((option) => (
+                      <SelectItem
+                        key={option}
+                        value={option}
+                        data-testid={`text-position-select-option-${option}`}
+                      >
+                        {option.charAt(0).toUpperCase() + option.slice(1)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <div className="space-y-1">
+                  <Label className="text-xs" htmlFor="legacy-quote-font-size">
+                    Legacy quote font size (px, single-column sheets)
+                  </Label>
+                  <Input
+                    id="legacy-quote-font-size"
+                    type="number"
+                    min={6}
+                    max={500}
+                    className="h-9 bg-white dark:bg-slate-900"
+                    data-testid="legacy-quote-font-size-input"
+                    value={legacyQuoteFontSize}
+                    onChange={(e) => setLegacyQuoteFontSize(e.target.value)}
+                    onBlur={() => setLegacyQuoteFontSize((s) => clampFontSizeInput(s))}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label data-testid="batch-size-label">Batch size</Label>
+                <Select value={batchSize} onValueChange={setBatchSize}>
+                  <SelectTrigger className="bg-white dark:bg-slate-900" data-testid="batch-size-select-trigger">
+                    <SelectValue placeholder="Select batch size" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {batchSizeOptions.map((option) => (
+                      <SelectItem
+                        key={option}
+                        value={option}
+                        data-testid={`batch-size-select-option-${option}`}
+                      >
+                        {option} pins
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <Button
+                onClick={handleGenerate}
+                disabled={isGenerating}
+                className="h-11 w-full rounded-full bg-[#E60023] text-base font-semibold text-white hover:bg-[#AD081B]"
+                data-testid="generate-pins-button"
+              >
+                {isGenerating ? (
+                  <>
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                    Generating...
+                  </>
+                ) : (
+                  <>
+                    <ImagePlus className="h-4 w-4" />
+                    Generate {mode === "ai" ? "AI" : "Custom"} Pins
+                  </>
+                )}
+              </Button>
+            </CardContent>
+          </Card>
+
+          <div className="space-y-8">
+            <Card className="rounded-3xl border border-slate-200 bg-white/90 shadow-[0_8px_32px_rgba(15,23,42,0.08)] dark:border-slate-700 dark:bg-slate-900/90">
+              <CardHeader>
+                <CardTitle className="heading-font text-2xl text-slate-900 dark:text-slate-100" data-testid="generation-status-title">
+                  Generation Status
+                </CardTitle>
+                <CardDescription data-testid="generation-status-subtitle">
+                  Real-time progress for {mode === "ai" ? "AI" : "Custom"} rendering in your selected 50/100 pin batch.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <Progress
+                  value={progressValue}
+                  className="h-3 bg-slate-100 dark:bg-slate-800 [&>div]:bg-[#E60023]"
+                  data-testid="pin-generation-progress-bar"
+                />
+                <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-700 dark:text-slate-200">
+                  <span data-testid="progress-value-text">Progress: {Math.round(progressValue)}%</span>
+                  <span data-testid="generated-count-text">Generated Pins: {generatedCount}</span>
+                  <span className="truncate" data-testid="generation-session-id-text">
+                    Session: {sessionId || "Not started"}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 sm:grid-cols-3">
+                  <div data-testid="rows-processed-stat">Rows processed: {mappingStats.total_rows_processed}</div>
+                  <div data-testid="images-matched-stat">Images matched: {mappingStats.images_matched}</div>
+                  <div data-testid="missing-images-stat">Missing images: {mappingStats.missing_images_count}</div>
+                </div>
+                <div className="flex flex-wrap gap-3 pt-2">
+                  <Button
+                    onClick={handleDownloadAll}
+                    variant="outline"
+                    className="rounded-full border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+                    data-testid="download-all-zip-button"
+                  >
+                    <Download className="h-4 w-4" />
+                    Download ZIP
+                  </Button>
+                  <Button
+                    onClick={() => handleExportMetadata("csv")}
+                    variant="outline"
+                    className="rounded-full border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+                    data-testid="export-metadata-csv-button"
+                  >
+                    <FileSpreadsheet className="h-4 w-4" />
+                    Export CSV
+                  </Button>
+                  <Button
+                    onClick={() => handleExportMetadata("json")}
+                    variant="outline"
+                    className="rounded-full border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+                    data-testid="export-metadata-json-button"
+                  >
+                    <FileSpreadsheet className="h-4 w-4" />
+                    Export JSON
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {skippedWarnings.length > 0 ? (
+              <Card className="rounded-3xl border border-amber-200 bg-amber-50/80 shadow-[0_8px_20px_rgba(180,83,9,0.08)] dark:border-amber-700 dark:bg-amber-950/30">
+                <CardHeader>
+                  <CardTitle className="heading-font text-xl text-amber-900 dark:text-amber-200" data-testid="skipped-rows-title">
+                    Skipped Rows Details
+                  </CardTitle>
+                  <CardDescription data-testid="skipped-rows-description">
+                    These rows were skipped due to missing required data or missing PIC NO. image matches.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <ul className="max-h-40 space-y-2 overflow-y-auto text-sm text-amber-900 dark:text-amber-100" data-testid="skipped-rows-list">
+                    {skippedWarnings.map((warning, index) => (
+                      <li key={`${warning}-${index}`} data-testid={`skipped-row-item-${index}`}>
+                        • {warning}
+                      </li>
+                    ))}
+                  </ul>
+                </CardContent>
+              </Card>
+            ) : null}
+
+            <section className="space-y-5" data-testid="preview-grid-section">
+              <div className="flex items-center justify-between gap-4">
+                <h2 className="heading-font text-base font-semibold text-slate-900 md:text-lg dark:text-slate-100" data-testid="preview-grid-title">
+                  Pin Preview Dashboard
+                </h2>
+                <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="preview-grid-count-text">
+                  {generatedCount} pin(s)
+                </p>
+              </div>
+
+              {pins.length === 0 ? (
+                <div
+                  className="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center text-sm text-slate-500 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300"
+                  data-testid="preview-empty-state"
+                >
+                  Generate pins to see previews, download images, and export metadata.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-3" data-testid="preview-grid-list">
+                  {pins.map((pin) => (
+                    <PinCard
+                      key={pin.pin_id}
+                      pin={pin}
+                      backendUrl={BACKEND_URL}
+                      onDownload={handleDownloadSingle}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+export default App;

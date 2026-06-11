@@ -54,6 +54,45 @@ const clampFontSizeInput = (raw) => {
   return String(Math.min(500, Math.max(6, n)));
 };
 
+const normalizeHexColor = (raw, fallback = "#FFFFFF") => {
+  let value = String(raw ?? fallback).trim();
+  if (!value.startsWith("#")) value = `#${value}`;
+  if (/^#[0-9a-fA-F]{3}$/.test(value)) {
+    const hex = value.slice(1);
+    value = `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`;
+  }
+  if (!/^#[0-9a-fA-F]{6}$/.test(value)) return fallback.toUpperCase();
+  return value.toUpperCase();
+};
+
+function ColorPickerField({ label, value, onChange, testId }) {
+  const safeValue = normalizeHexColor(value);
+
+  return (
+    <div className="space-y-1">
+      <Label className="text-xs">{label}</Label>
+      <div className="flex items-center gap-2">
+        <input
+          type="color"
+          value={safeValue}
+          onChange={(event) => onChange(normalizeHexColor(event.target.value))}
+          className="h-9 w-11 shrink-0 cursor-pointer rounded-md border border-slate-300 bg-white p-0.5 dark:border-slate-600 dark:bg-slate-900"
+          data-testid={testId ? `${testId}-picker` : undefined}
+          aria-label={`${label} color picker`}
+        />
+        <Input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onBlur={() => onChange(normalizeHexColor(value))}
+          className="h-9 flex-1 bg-white font-mono text-xs uppercase dark:bg-slate-900"
+          placeholder="#FFFFFF"
+          data-testid={testId}
+        />
+      </div>
+    </div>
+  );
+}
+
 const defaultSlotsForCount = (count) => {
   if (count === "1") return ["center"];
   if (count === "2") return ["top", "bottom"];
@@ -81,6 +120,11 @@ function App() {
   const [endLineFontStyle, setEndLineFontStyle] = useState("chewy");
   const [endLineFontSize, setEndLineFontSize] = useState("12");
   const [legacyQuoteFontSize, setLegacyQuoteFontSize] = useState("12");
+  const [titleTopColor, setTitleTopColor] = useState("#FFFFFF");
+  const [titleCenterColor, setTitleCenterColor] = useState("#FFFFFF");
+  const [titleBottomColor, setTitleBottomColor] = useState("#FFFFFF");
+  const [endLineColor, setEndLineColor] = useState("#121218");
+  const [legacyQuoteColor, setLegacyQuoteColor] = useState("#FFFFFF");
   const [batchSize, setBatchSize] = useState("50");
   const [progressValue, setProgressValue] = useState(0);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -200,6 +244,11 @@ function App() {
       formData.append("end_line_font_style", endLineFontStyle);
       formData.append("end_line_font_size", clampFontSizeInput(endLineFontSize));
       formData.append("legacy_quote_font_size", clampFontSizeInput(legacyQuoteFontSize));
+      formData.append("title_top_color", normalizeHexColor(titleTopColor));
+      formData.append("title_center_color", normalizeHexColor(titleCenterColor));
+      formData.append("title_bottom_color", normalizeHexColor(titleBottomColor));
+      formData.append("end_line_color", normalizeHexColor(endLineColor, "#121218"));
+      formData.append("legacy_quote_color", normalizeHexColor(legacyQuoteColor));
       formData.append("max_pins", batchSize);
 
       const response = await axios.post(`${API}/pins/generate`, formData, {
@@ -538,7 +587,7 @@ function App() {
                 ) : null}
 
                 {["top", "center", "bottom"].map((slot) => (
-                  <div key={slot} className="grid gap-2 sm:grid-cols-2">
+                  <div key={slot} className="grid gap-2 sm:grid-cols-3">
                     <div className="space-y-1">
                       <Label className="text-xs capitalize">{slot} font style</Label>
                       <Select
@@ -591,10 +640,28 @@ function App() {
                         }}
                       />
                     </div>
+                    <ColorPickerField
+                      label={`${slot} text color`}
+                      testId={`title-${slot}-color-input`}
+                      value={
+                        slot === "top"
+                          ? titleTopColor
+                          : slot === "center"
+                            ? titleCenterColor
+                            : titleBottomColor
+                      }
+                      onChange={
+                        slot === "top"
+                          ? setTitleTopColor
+                          : slot === "center"
+                            ? setTitleCenterColor
+                            : setTitleBottomColor
+                      }
+                    />
                   </div>
                 ))}
 
-                <div className="grid gap-2 sm:grid-cols-2 border-t border-slate-200 pt-3 dark:border-slate-600">
+                <div className="grid gap-2 border-t border-slate-200 pt-3 dark:border-slate-600 sm:grid-cols-2">
                   <div className="space-y-1">
                     <Label className="text-xs">End line font style</Label>
                     <Select value={endLineFontStyle} onValueChange={setEndLineFontStyle}>
@@ -623,6 +690,12 @@ function App() {
                       onBlur={() => setEndLineFontSize((s) => clampFontSizeInput(s))}
                     />
                   </div>
+                  <ColorPickerField
+                    label="End line text color"
+                    testId="end-line-color-input"
+                    value={endLineColor}
+                    onChange={setEndLineColor}
+                  />
                 </div>
               </div>
 
@@ -660,6 +733,12 @@ function App() {
                     onBlur={() => setLegacyQuoteFontSize((s) => clampFontSizeInput(s))}
                   />
                 </div>
+                <ColorPickerField
+                  label="Legacy quote text color"
+                  testId="legacy-quote-color-input"
+                  value={legacyQuoteColor}
+                  onChange={setLegacyQuoteColor}
+                />
               </div>
 
               <div className="space-y-2">

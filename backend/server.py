@@ -636,6 +636,166 @@ def read_tabular_file(file_name: str, file_bytes: bytes, header: int | None) -> 
     return dataframe
 
 
+MULTI_TITLE_HEADER_ALIASES = {
+    "pintitletop",
+    "pintitlecenter",
+    "pintitlebottom",
+    "pintitletopbold",
+    "pintitlecenterbold",
+    "pintitlebottombold",
+}
+
+MULTI_TITLE_FIELDS = [
+    "PIC NO.",
+    "PIN TITLE - TOP",
+    "PIN TITLE - CENTER",
+    "PIN TITLE - BOTTOM",
+    "PIN TITLE 2ND LINE",
+    "PIN NAME",
+]
+
+DEFAULT_MULTI_TITLE_COLUMNS: Dict[str, int] = {
+    "PIC NO.": 0,
+    "PIN TITLE - TOP": 1,
+    "PIN TITLE - CENTER": 2,
+    "PIN TITLE - BOTTOM": 3,
+    "PIN TITLE 2ND LINE": 4,
+    "PIN NAME": 5,
+}
+
+ROW_SKIP_MARKERS = (
+    "pin size",
+    "font size",
+    "front size",
+    "font style",
+    "pixels",
+    "1:2.1",
+    "ratio",
+    "cormorant",
+    "chewy",
+    "cursive",
+    "1000 x",
+    "1200 x",
+    "standard pin",
+    "long pin",
+    "big pin",
+)
+
+
+def _row_text_blob(row_values: Any) -> str:
+    return " ".join(clean_text(value).lower() for value in row_values if clean_text(value))
+
+
+def is_whitespace_row(row_values: Any) -> bool:
+    return not _row_text_blob(row_values)
+
+
+def row_looks_like_instruction(row_values: Any) -> bool:
+    blob = _row_text_blob(row_values)
+    if not blob:
+        return False
+    return any(marker in blob for marker in ROW_SKIP_MARKERS)
+
+
+def _header_cell_matches_field(normalized_cell: str, field: str) -> bool:
+    if not normalized_cell:
+        return False
+    aliases = HEADER_ALIASES.get(field, [])
+    if normalized_cell in aliases:
+        return True
+    field_norm = normalize_header_name(field)
+    return normalized_cell == field_norm
+
+
+def build_multi_title_column_map(header_cells: List[Any]) -> Dict[str, int]:
+    col_map: Dict[str, int] = {}
+    for idx, cell in enumerate(header_cells):
+        norm = normalize_header_name(cell)
+        if not norm:
+            continue
+        for field in MULTI_TITLE_FIELDS:
+            if field in col_map:
+                continue
+            if _header_cell_matches_field(norm, field):
+                col_map[field] = idx
+    for field, idx in DEFAULT_MULTI_TITLE_COLUMNS.items():
+        col_map.setdefault(field, idx)
+    return col_map
+
+
+def detect_multi_title_layout(raw_dataframe: pd.DataFrame) -> tuple[int, int] | None:
+    """Return (header_row_index, first_data_row_index) for multi-title workbooks."""
+    scan_limit = min(len(raw_dataframe), 40)
+    if scan_limit < 2:
+        return None
+
+    for row_idx in range(scan_limit):
+        row_set = {
+            normalize_header_name(value)
+            for value in raw_dataframe.iloc[row_idx].tolist()
+            if clean_text(value)
+        }
+        if "picno" in row_set and row_set.intersection(MULTI_TITLE_HEADER_ALIASES):
+            return row_idx, row_idx + 1
+
+    for row_idx in range(scan_limit - 1):
+        marker_row = {
+            normalize_header_name(value)
+            for value in raw_dataframe.iloc[row_idx].tolist()
+            if clean_text(value)
+        }
+        header_row = {
+            normalize_header_name(value)
+            for value in raw_dataframe.iloc[row_idx + 1].tolist()
+            if clean_text(value)
+        }
+        if not marker_row.intersection({"top", "center", "bottom"}):
+            continue
+        if "picno" not in header_row:
+            continue
+        if header_row.intersection(MULTI_TITLE_HEADER_ALIASES) or "pinname" in header_row:
+            return row_idx + 1, row_idx + 2
+
+    return None
+
+
+def find_multi_title_data_end(raw_dataframe: pd.DataFrame, data_start_row: int) -> int:
+    """Exclusive end row — stops before footer notes or long blank runs."""
+    consecutive_empty = 0
+    for row_idx in range(data_start_row, len(raw_dataframe)):
+        row_values = raw_dataframe.iloc[row_idx].tolist()
+        if row_looks_like_instruction(row_values):
+            return row_idx
+        if is_whitespace_row(row_values):
+            consecutive_empty += 1
+            if consecutive_empty >= 8:
+                return row_idx - consecutive_empty
+            continue
+        consecutive_empty = 0
+    return len(raw_dataframe)
+
+
+def infer_pin_name_from_row(row: Dict[str, Any], row_index: int) -> str:
+    pin_name = clean_text(row.get("PIN NAME"))
+    if pin_name:
+        return pin_name
+
+    pic_no = normalize_pic_no(row.get("PIC NO."))
+    if pic_no:
+        return f"pin-{pic_no}"
+
+    for field in ("PIN TITLE - CENTER", "PIN TITLE - TOP", "PIN TITLE - BOTTOM"):
+        title = clean_text(row.get(field))
+        if title:
+            return title[:120]
+
+    end_line = clean_text(row.get("PIN TITLE 2ND LINE"))
+    if end_line:
+        return end_line[:120]
+
+    return f"pin-row-{row_index}"
+
+
 def is_two_section_pin_layout(raw_dataframe: pd.DataFrame) -> bool:
     if len(raw_dataframe) < 3:
         return False
@@ -692,58 +852,41 @@ def parse_two_section_pin_layout(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 def is_multi_title_pin_layout(raw_dataframe: pd.DataFrame) -> bool:
-    if len(raw_dataframe) < 3:
-        return False
-
-    first_row = {
-        normalize_header_name(value)
-        for value in raw_dataframe.iloc[0].tolist()
-        if clean_text(value)
-    }
-    second_row = {
-        normalize_header_name(value)
-        for value in raw_dataframe.iloc[1].tolist()
-        if clean_text(value)
-    }
-
-    has_position_markers = bool(first_row.intersection({"top", "center", "bottom"}))
-    has_title_headers = bool(
-        second_row.intersection(
-            {
-                "pintitletop",
-                "pintitlecenter",
-                "pintitlebottom",
-                "pintitletopbold",
-                "pintitlecenterbold",
-                "pintitlebottombold",
-            }
-        )
-    )
-    return has_position_markers and "picno" in second_row and has_title_headers
+    return detect_multi_title_layout(raw_dataframe) is not None
 
 
 def parse_multi_title_pin_layout(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
-    data = raw_dataframe.iloc[2:].copy().reset_index(drop=True)
+    layout = detect_multi_title_layout(raw_dataframe)
+    if layout is None:
+        raise HTTPException(status_code=400, detail="Could not detect multi-title Excel layout.")
+
+    header_row_index, data_start_row = layout
+    data_end_row = find_multi_title_data_end(raw_dataframe, data_start_row)
+    data = raw_dataframe.iloc[data_start_row:data_end_row].copy().reset_index(drop=True)
     if data.empty:
         raise HTTPException(status_code=400, detail="No data rows found in multi-title PIN section.")
 
-    def get_column(index: int) -> pd.Series:
-        if index >= data.shape[1]:
+    header_cells = raw_dataframe.iloc[header_row_index].tolist()
+    col_map = build_multi_title_column_map(header_cells)
+
+    def get_column(field: str) -> pd.Series:
+        index = col_map.get(field, -1)
+        if index < 0 or index >= data.shape[1]:
             return pd.Series([""] * len(data))
         return data.iloc[:, index].fillna("").astype(str).map(clean_text)
 
     parsed = pd.DataFrame(
         {
-            "PIC NO.": get_column(0),
-            "PIN TITLE - TOP": get_column(1),
-            "PIN TITLE - CENTER": get_column(2),
-            "PIN TITLE - BOTTOM": get_column(3),
-            "PIN TITLE 2ND LINE": get_column(4),
-            "PIN NAME": get_column(5),
-            "Quote": get_column(2),
+            "PIC NO.": get_column("PIC NO."),
+            "PIN TITLE - TOP": get_column("PIN TITLE - TOP"),
+            "PIN TITLE - CENTER": get_column("PIN TITLE - CENTER"),
+            "PIN TITLE - BOTTOM": get_column("PIN TITLE - BOTTOM"),
+            "PIN TITLE 2ND LINE": get_column("PIN TITLE 2ND LINE"),
+            "PIN NAME": get_column("PIN NAME"),
+            "Quote": get_column("PIN TITLE - CENTER"),
             "PINREST INPUT": "",
-            "Meta Title": get_column(5),
-            "Meta Description": get_column(2),
+            "Meta Title": get_column("PIN NAME"),
+            "Meta Description": get_column("PIN TITLE - CENTER"),
             "Hashtags": "",
             "TAG TOPIC": "",
             "CREATOR": "",
@@ -751,37 +894,52 @@ def parse_multi_title_pin_layout(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    for index, row in parsed.iterrows():
-        titles = [
-            clean_text(row.get("PIN TITLE - TOP")),
-            clean_text(row.get("PIN TITLE - CENTER")),
-            clean_text(row.get("PIN TITLE - BOTTOM")),
-        ]
-        primary_quote = next((title for title in titles if title), clean_text(row.get("PIN NAME")))
-        parsed.at[index, "Quote"] = primary_quote
-        if not clean_text(row.get("Meta Title")):
-            parsed.at[index, "Meta Title"] = clean_text(row.get("PIN NAME")) or primary_quote
+    valid_rows: List[Dict[str, Any]] = []
+    for row_index, row in parsed.iterrows():
+        row_values = row.to_dict()
+        if row_looks_like_instruction(row_values.values()):
+            continue
 
-    parsed = parsed[
-        (parsed["PIN NAME"] != "")
-        & (
-            (parsed["PIN TITLE - TOP"] != "")
-            | (parsed["PIN TITLE - CENTER"] != "")
-            | (parsed["PIN TITLE - BOTTOM"] != "")
+        has_title = any(
+            clean_text(row_values.get(field))
+            for field in ("PIN TITLE - TOP", "PIN TITLE - CENTER", "PIN TITLE - BOTTOM")
         )
-    ].reset_index(drop=True)
+        has_end_line = bool(clean_text(row_values.get("PIN TITLE 2ND LINE")))
+        has_pic_or_name = bool(
+            normalize_pic_no(row_values.get("PIC NO.")) or clean_text(row_values.get("PIN NAME"))
+        )
 
-    if parsed.empty:
+        if not has_title and not (has_end_line and has_pic_or_name):
+            continue
+
+        titles = [
+            clean_text(row_values.get("PIN TITLE - TOP")),
+            clean_text(row_values.get("PIN TITLE - CENTER")),
+            clean_text(row_values.get("PIN TITLE - BOTTOM")),
+        ]
+        primary_quote = next((title for title in titles if title), "")
+        row_values["Quote"] = primary_quote or infer_pin_name_from_row(row_values, int(row_index) + 1)
+        row_values["PIN NAME"] = infer_pin_name_from_row(row_values, int(row_index) + 1)
+        if not clean_text(row_values.get("Meta Title")):
+            row_values["Meta Title"] = row_values["PIN NAME"]
+        if not clean_text(row_values.get("Meta Description")) and primary_quote:
+            row_values["Meta Description"] = primary_quote
+        valid_rows.append(row_values)
+
+    if not valid_rows:
         raise HTTPException(
             status_code=400,
-            detail="No valid rows with PIN NAME and at least one title (top/center/bottom) found.",
+            detail=(
+                "No valid pin rows found. Each row needs at least one title (top, center, or bottom). "
+                "PIN NAME can be left blank — it will be filled from PIC NO. or your titles."
+            ),
         )
 
-    return parsed
+    return pd.DataFrame(valid_rows).reset_index(drop=True)
 
 
 def detect_header_row(raw_dataframe: pd.DataFrame) -> int | None:
-    scan_limit = min(len(raw_dataframe), 12)
+    scan_limit = min(len(raw_dataframe), 40)
     header_vocabulary = set()
     for aliases in HEADER_ALIASES.values():
         header_vocabulary.update(aliases)
@@ -888,7 +1046,16 @@ def standardize_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
         if "pin title" in first_row_text and "pin description" in first_row_text:
             parsed = parsed.iloc[1:].reset_index(drop=True)
 
-    parsed = parsed[parsed["PIN NAME"] != ""].reset_index(drop=True)
+    keep_mask = []
+    for _, row in parsed.iterrows():
+        row_dict = row.to_dict()
+        if row_looks_like_instruction(row_dict.values()):
+            keep_mask.append(False)
+            continue
+        has_pin_name = bool(clean_text(row_dict.get("PIN NAME")))
+        has_quote = bool(clean_text(row_dict.get("Quote")))
+        keep_mask.append(has_pin_name or has_quote)
+    parsed = parsed[keep_mask].reset_index(drop=True)
 
     if parsed.empty:
         raise HTTPException(status_code=400, detail="No valid rows found after parsing. Please verify your header row.")
@@ -898,7 +1065,7 @@ def standardize_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 def parse_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     raw = read_tabular_file(file_name, file_bytes, header=None)
-    if is_multi_title_pin_layout(raw):
+    if detect_multi_title_layout(raw) is not None:
         return parse_multi_title_pin_layout(raw)
     if is_two_section_pin_layout(raw):
         return parse_two_section_pin_layout(raw)
@@ -1067,6 +1234,26 @@ def scaled_font_size_px(base_px: int, canvas_height: int) -> int:
     return max(6, min(500, int(round(base_px * (canvas_height / 1500)))))
 
 
+def parse_hex_color(value: Any, default: str = "#FFFFFF") -> tuple[int, int, int, int]:
+    """Parse #RGB or #RRGGBB into RGBA (alpha always 255)."""
+    raw = clean_text(str(value or default)).lstrip("#")
+    if not raw:
+        raw = clean_text(default).lstrip("#") or "FFFFFF"
+    if len(raw) == 3:
+        raw = "".join(ch * 2 for ch in raw)
+    if len(raw) != 6 or not re.fullmatch(r"[0-9a-fA-F]{6}", raw):
+        raw = clean_text(default).lstrip("#") or "FFFFFF"
+        if len(raw) == 3:
+            raw = "".join(ch * 2 for ch in raw)
+    try:
+        r = int(raw[0:2], 16)
+        g = int(raw[2:4], 16)
+        b = int(raw[4:6], 16)
+    except ValueError:
+        return (255, 255, 255, 255)
+    return (r, g, b, 255)
+
+
 def resolve_title_slots(title_count: int, title_slots_raw: str) -> List[str]:
     valid_slots = {"top", "center", "bottom"}
     if clean_text(title_slots_raw):
@@ -1092,8 +1279,10 @@ def build_title_blocks(
     title_slots_raw: str,
     style_by_slot: Dict[str, str],
     size_by_slot: Dict[str, int] | None,
+    color_by_slot: Dict[str, str] | None = None,
 ) -> List[Dict[str, Any]]:
     sizes = size_by_slot or {}
+    colors = color_by_slot or {}
     slot_text = {
         "top": clean_text(row.get("PIN TITLE - TOP")),
         "center": clean_text(row.get("PIN TITLE - CENTER")),
@@ -1110,6 +1299,7 @@ def build_title_blocks(
                 "position": slot,
                 "font_style": normalize_font_style(style_by_slot.get(slot, "bold")),
                 "font_size_px": int(sizes.get(slot, 12)),
+                "text_color": colors.get(slot, "#FFFFFF"),
             }
         )
     return blocks
@@ -1185,6 +1375,7 @@ def _draw_headline_block(
     canvas_width: int,
     start_y: int,
     line_gap: int,
+    text_color: tuple[int, int, int, int] = (255, 255, 255, 255),
 ) -> None:
     cursor_y = float(start_y)
     line_height = font.size if hasattr(font, "size") else 96
@@ -1201,9 +1392,9 @@ def _draw_headline_block(
             (x, y),
             line,
             font=font,
-            fill=(255, 255, 255, 255),
+            fill=text_color,
             stroke_width=sw,
-            stroke_fill=(255, 255, 255, 255),
+            stroke_fill=text_color,
         )
         cursor_y += (line_box[3] - line_box[1]) + line_gap
 
@@ -1218,6 +1409,8 @@ def render_pin(
     end_line_font_style: str = "bold",
     end_line_font_size_px: int = 12,
     quote_font_size_px: int = 12,
+    end_line_text_color: str = "#121218",
+    quote_text_color: str = "#FFFFFF",
 ) -> Image.Image:
     width, height = canvas_size
     canvas = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS).convert("RGBA")
@@ -1257,6 +1450,7 @@ def render_pin(
                     "lines": lines,
                     "total_height": total_height,
                     "line_gap": line_gap,
+                    "text_color": parse_hex_color(block.get("text_color"), "#FFFFFF"),
                 }
             )
     else:
@@ -1277,6 +1471,7 @@ def render_pin(
                 "lines": lines,
                 "total_height": total_height,
                 "line_gap": line_gap,
+                "text_color": parse_hex_color(quote_text_color, "#FFFFFF"),
             }
         )
 
@@ -1322,8 +1517,17 @@ def render_pin(
             top_padding,
             min(start_y, image_bottom - block_height - int(40 * scale)),
         )
-        _draw_headline_block(draw, block["lines"], block["font"], width, start_y, block["line_gap"])
+        _draw_headline_block(
+            draw,
+            block["lines"],
+            block["font"],
+            width,
+            start_y,
+            block["line_gap"],
+            block.get("text_color", (255, 255, 255, 255)),
+        )
 
+    end_line_rgba = parse_hex_color(end_line_text_color, "#121218")
     y_bar_top = height - bar_height
     cursor_y = y_bar_top + (bar_height - bar_text_block) / 2
     for idx, bl in enumerate(bar_lines):
@@ -1334,7 +1538,7 @@ def render_pin(
         by = cursor_y
         for ox, oy in ((2, 2), (1, 1)):
             draw.text((bx + ox, by + oy), bl, font=bottom_font, fill=(0, 0, 0, 40))
-        draw.text((bx, by), bl, font=bottom_font, fill=(18, 18, 24))
+        draw.text((bx, by), bl, font=bottom_font, fill=end_line_rgba)
         cursor_y += bh + (line_spacing_bar if idx < len(bar_lines) - 1 else 0)
 
     return canvas.convert("RGB")
@@ -1365,6 +1569,9 @@ def create_pin_payload(
     end_line_font_style: str = "bold",
     end_line_font_size_px: int = 12,
     quote_font_size_px: int = 12,
+    color_by_slot: Dict[str, str] | None = None,
+    end_line_text_color: str = "#121218",
+    quote_text_color: str = "#FFFFFF",
 ) -> Dict[str, Any]:
     pin_name = clean_text(row.get("PIN NAME"))
     pin_title_top = clean_text(row.get("PIN TITLE - TOP"))
@@ -1381,7 +1588,8 @@ def create_pin_payload(
     canvas_size = PIN_SIZE_PRESETS.get(pin_size_key, PIN_SIZE_PRESETS["standard"])
     style_map = style_by_slot or {}
     size_map = size_by_slot or {}
-    title_blocks = build_title_blocks(row, title_count, title_slots_raw, style_map, size_map)
+    color_map = color_by_slot or {}
+    title_blocks = build_title_blocks(row, title_count, title_slots_raw, style_map, size_map, color_map)
     has_split_titles = bool(pin_title_top or pin_title_center or pin_title_bottom)
 
     rendered = render_pin(
@@ -1394,6 +1602,8 @@ def create_pin_payload(
         end_line_font_style=end_line_font_style,
         end_line_font_size_px=end_line_font_size_px,
         quote_font_size_px=quote_font_size_px,
+        end_line_text_color=end_line_text_color,
+        quote_text_color=quote_text_color,
     )
     base_slug = slugify_filename(pin_name or quote, index)
     file_name = make_unique_filename(session_dir, base_slug)
@@ -1492,6 +1702,11 @@ async def generate_pins(
     end_line_font_style: str = Form("chewy"),
     end_line_font_size: str = Form("12"),
     legacy_quote_font_size: str = Form("12"),
+    title_top_color: str = Form("#FFFFFF"),
+    title_center_color: str = Form("#FFFFFF"),
+    title_bottom_color: str = Form("#FFFFFF"),
+    end_line_color: str = Form("#121218"),
+    legacy_quote_color: str = Form("#FFFFFF"),
     max_pins: int = Form(50),
     quotes_file: UploadFile | None = File(default=None),
     custom_images: List[UploadFile] = File(default=[]),
@@ -1527,6 +1742,13 @@ async def generate_pins(
     end_line_font_size_px = parse_font_size_px(end_line_font_size, 12)
     quote_font_size_px = parse_font_size_px(legacy_quote_font_size, 12)
     end_line_style = normalize_font_style(end_line_font_style, "chewy")
+    color_by_slot = {
+        "top": clean_text(title_top_color) or "#FFFFFF",
+        "center": clean_text(title_center_color) or "#FFFFFF",
+        "bottom": clean_text(title_bottom_color) or "#FFFFFF",
+    }
+    end_line_text_color = clean_text(end_line_color) or "#121218"
+    quote_text_color = clean_text(legacy_quote_color) or "#FFFFFF"
 
     total_limit = min(max_pins, 100)
     data_file_name = clean_text(data_file.filename)
@@ -1571,12 +1793,11 @@ async def generate_pins(
         title_bottom_value = clean_text(row.get("PIN TITLE - BOTTOM"))
         has_title_text = bool(title_top_value or title_center_value or title_bottom_value or quote_value)
 
-        if not pin_name_value or not has_title_text:
-            skipped_warnings.append(
-                f"Skipped row {row_index}: missing {'PIN NAME' if not pin_name_value else ''}"
-                f"{' and ' if (not pin_name_value and not has_title_text) else ''}"
-                f"{'title/quote text' if not has_title_text else ''}."
-            )
+        if not pin_name_value:
+            pin_name_value = infer_pin_name_from_row(row, row_index)
+
+        if not has_title_text:
+            skipped_warnings.append(f"Skipped row {row_index}: missing title/quote text.")
             continue
 
         if not quote_value:
@@ -1590,7 +1811,7 @@ async def generate_pins(
     if not valid_records:
         raise HTTPException(
             status_code=400,
-            detail="No valid rows found with PIN NAME and at least one title or quote.",
+            detail="No valid rows found. Each row needs at least one title (top/center/bottom) or quote text.",
         )
 
     records = valid_records
@@ -1733,6 +1954,9 @@ async def generate_pins(
                 end_line_style,
                 end_line_font_size_px,
                 quote_font_size_px,
+                color_by_slot,
+                end_line_text_color,
+                quote_text_color,
             )
             async with progress_lock:
                 generation_progress["generated_count"] += 1

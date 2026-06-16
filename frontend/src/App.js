@@ -55,6 +55,24 @@ const clampFontSizeInput = (raw) => {
   return String(Math.min(500, Math.max(6, n)));
 };
 
+const formatApiError = (error, fallback) => {
+  if (!error?.response) {
+    if (error?.code === "ERR_NETWORK") {
+      return "Cannot reach the server. Make sure the backend is running on port 8000, then refresh and try again.";
+    }
+    return error?.message || fallback;
+  }
+  const detail = error.response.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item?.msg || JSON.stringify(item)).join("; ");
+  }
+  if (detail && typeof detail === "object") {
+    return detail.message || JSON.stringify(detail);
+  }
+  return fallback;
+};
+
 const normalizeHexColor = (raw, fallback = "#FFFFFF") => {
   let value = String(raw ?? fallback).trim();
   if (!value.startsWith("#")) value = `#${value}`;
@@ -104,7 +122,7 @@ function App() {
   const [excelFile, setExcelFile] = useState(null);
   const [wordFile, setWordFile] = useState(null);
   const [templateFile, setTemplateFile] = useState(null);
-  const [mode, setMode] = useState("ai");
+  const [mode, setMode] = useState("custom");
   const [customImageFiles, setCustomImageFiles] = useState([]);
   const [customZipFile, setCustomZipFile] = useState(null);
   const [imageLinks, setImageLinks] = useState("");
@@ -140,6 +158,26 @@ function App() {
     images_matched: 0,
     missing_images_count: 0,
   });
+  const [excelRowCount, setExcelRowCount] = useState(null);
+
+  const validateExcelFile = async (file) => {
+    if (!file) {
+      setExcelRowCount(null);
+      return;
+    }
+    try {
+      const formData = new FormData();
+      formData.append("data_file", file);
+      const response = await axios.post(`${API}/pins/validate-excel`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setExcelRowCount(response.data.row_count ?? null);
+      toast.success(`Excel OK — ${response.data.row_count} pin row(s) detected.`);
+    } catch (error) {
+      setExcelRowCount(null);
+      toast.error(formatApiError(error, "Could not read this Excel file. Check the format and try again."));
+    }
+  };
 
   const generatedCount = useMemo(() => pins.length, [pins]);
 
@@ -283,7 +321,7 @@ function App() {
         toast.warning(`Skipped ${response.data.skipped_rows} row(s) missing PIN NAME or Quote.`);
       }
     } catch (error) {
-      const message = error?.response?.data?.detail || "Pin generation failed. Please check your file format.";
+      const message = formatApiError(error, "Pin generation failed. Please check your file format.");
       setProgressValue(0);
       toast.error(message);
 
@@ -440,9 +478,18 @@ function App() {
                   id="excel-file"
                   type="file"
                   accept=".xlsx,.csv"
-                  onChange={(event) => setExcelFile(event.target.files?.[0] || null)}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0] || null;
+                    setExcelFile(file);
+                    validateExcelFile(file);
+                  }}
                   data-testid="excel-upload-input"
                 />
+                {excelRowCount != null ? (
+                  <p className="text-xs text-emerald-600 dark:text-emerald-400" data-testid="excel-row-count-hint">
+                    {excelRowCount} pin row(s) ready in this file.
+                  </p>
+                ) : null}
               </div>
 
               <div className="space-y-2">

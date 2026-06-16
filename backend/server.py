@@ -732,6 +732,8 @@ MULTI_TITLE_HEADER_ALIASES = {
     "pintitletopbold",
     "pintitlecenterbold",
     "pintitlebottombold",
+    "endline",
+    "pinname",
 }
 
 MULTI_TITLE_FIELDS = [
@@ -1167,7 +1169,17 @@ def standardize_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
-    raw = read_tabular_file(file_name, file_bytes, header=None)
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        raw = read_tabular_file(file_name, file_bytes, header=None)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not open spreadsheet ({clean_text(file_name)}). Save as .xlsx or .csv and try again.",
+        ) from exc
+
     if detect_multi_title_layout(raw) is not None:
         return parse_multi_title_pin_layout(raw)
     if is_two_section_pin_layout(raw):
@@ -1194,7 +1206,12 @@ def parse_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         header_values = [clean_text(value) for value in raw.iloc[header_row].tolist()]
         rebuilt = raw.iloc[header_row + 1 :].copy().reset_index(drop=True)
         rebuilt.columns = header_values
-        return standardize_dataframe(rebuilt)
+        try:
+            return standardize_dataframe(rebuilt)
+        except HTTPException:
+            if detect_multi_title_layout(raw) is not None:
+                return parse_multi_title_pin_layout(raw)
+            raise first_error
 
 
 def _truetype_font_candidates(bold: bool) -> List[str]:
@@ -1766,6 +1783,27 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+
+@api_router.post("/pins/validate-excel")
+async def validate_excel(data_file: UploadFile = File(...)):
+    """Check that an Excel/CSV matches the expected Pinterest layout before generating pins."""
+    data_file_name = clean_text(data_file.filename)
+    if not data_file_name.lower().endswith((".xlsx", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload must be .xlsx or .csv")
+
+    file_bytes = await data_file.read()
+    dataframe = parse_file(data_file_name, file_bytes)
+    if dataframe.empty:
+        raise HTTPException(status_code=400, detail="Spreadsheet has no usable pin rows.")
+
+    sample_pin_name = clean_text(dataframe.iloc[0].get("PIN NAME"))
+    return {
+        "valid": True,
+        "row_count": len(dataframe),
+        "layout": "multi_title" if "PIN TITLE - TOP" in dataframe.columns else "standard",
+        "sample_pin_name": sample_pin_name or infer_pin_name_from_row(dataframe.iloc[0].to_dict(), 1),
+    }
+
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
     if db is None:
@@ -1963,6 +2001,15 @@ async def generate_pins(
     custom_assets: List[Dict[str, Any]] = []
     if custom_file_entries or clean_text(image_links):
         custom_assets = await asyncio.to_thread(load_custom_image_assets, custom_file_entries, image_links)
+
+    if mode == "ai" and not os.environ.get("GEMINI_API_KEY", "").strip() and not custom_assets and template_obj is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "AI mode needs a Gemini API key on the server. "
+                "Switch to Custom mode, upload your images (or a ZIP), then click Generate again."
+            ),
+        )
 
     if template_obj is not None:
         row_backgrounds = [template_obj.copy() for _ in records]

@@ -31,7 +31,7 @@ const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL ?? "").replace(/\/$/, "")
 const API = BACKEND_URL ? `${BACKEND_URL}/api` : "/api";
 
 const textPositionOptions = ["top", "center", "bottom"];
-const batchSizeOptions = ["50", "100"];
+const batchSizeOptions = ["25", "50", "100", "200", "500"];
 const pinSizeOptions = [
   { value: "standard", label: "Standard (1000×1500)" },
   { value: "long", label: "Long (1000×2100)" },
@@ -44,6 +44,7 @@ const fontStyleOptions = [
   { value: "bold", label: "Bold" },
   { value: "chewy", label: "Chewy" },
   { value: "cursive", label: "Cursive (Dancing Script)" },
+  { value: "playfair", label: "Elegant (Playfair Display)" },
 ];
 
 const clampFontSizeInput = (raw) => {
@@ -480,7 +481,7 @@ function App() {
                       data-testid="custom-images-upload-input"
                     />
                     <p className="text-xs text-slate-500 dark:text-slate-300" data-testid="custom-mapping-hint-text">
-                      Mapping uses PIC NO. only (e.g. row PIC NO. 5 matches 5.jpg/png/webp).
+                      Images match by PIC NO. first (e.g. row 5 → 5.jpg). If names differ, we use upload order so every row still gets a pin.
                     </p>
                   </div>
 

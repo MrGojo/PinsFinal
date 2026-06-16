@@ -167,7 +167,7 @@ LEGACY_FONT_SIZE_ALIASES: Dict[str, int] = {
     "xl": 144,
 }
 
-VALID_FONT_STYLES = {"bold", "italic", "chewy", "cursive"}
+VALID_FONT_STYLES = {"bold", "italic", "chewy", "cursive", "playfair"}
 
 HEADER_ALIASES: Dict[str, List[str]] = {
     "PIC NO.": ["picno", "picno.", "picnumber", "pic"],
@@ -252,12 +252,52 @@ def normalize_pic_no(value: Any) -> str:
         return ""
 
     sanitized = raw.replace(",", "").strip()
-    if re.fullmatch(r"\d+", sanitized):
-        return str(int(sanitized))
+    lowered = sanitized.lower()
 
     if re.fullmatch(r"\d+\.0+", sanitized):
         return str(int(float(sanitized)))
 
+    if re.fullmatch(r"\d+", sanitized):
+        return str(int(sanitized))
+
+    prefix_match = re.match(
+        r"^(?:pic(?:ture)?|no\.?|#|image|img)[\s\-]*(\d+(?:\.0+)?)$",
+        lowered,
+    )
+    if prefix_match:
+        return str(int(float(prefix_match.group(1))))
+
+    if len(sanitized) <= 10:
+        inner = re.search(r"\b(\d+)\b", sanitized)
+        if inner:
+            return str(int(inner.group(1)))
+
+    return ""
+
+
+def extract_pic_no_from_filename(filename: str) -> str:
+    safe_name = Path(clean_text(filename).replace("\\", "/")).name
+    stem = Path(safe_name).stem.strip()
+    if not stem:
+        return ""
+
+    direct = normalize_pic_no(stem)
+    if direct:
+        return direct
+
+    stem_lower = stem.lower()
+    patterns = (
+        r"^pic[\s\-_]*(\d+)$",
+        r"^img[\s\-_]*(\d+)$",
+        r"^image[\s\-_]*(\d+)$",
+        r"^photo[\s\-_]*(\d+)$",
+        r"^(\d+)[\-_\s].*$",
+        r".*[\-_](\d+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, stem_lower)
+        if match:
+            return str(int(match.group(1)))
     return ""
 
 
@@ -532,11 +572,12 @@ def load_custom_image_assets(
             continue
         try:
             image = Image.open(io.BytesIO(content)).convert("RGB")
-            stem = Path(filename).stem
+            base_name = Path(filename.replace("\\", "/")).name
+            stem = Path(base_name).stem
             assets.append(
                 {
-                    "slug": slugify_filename(stem, 0),
-                    "pic_no": normalize_pic_no(stem),
+                    "slug": slugify_filename(stem, len(assets)),
+                    "pic_no": extract_pic_no_from_filename(filename),
                     "image": image,
                 }
             )
@@ -551,11 +592,12 @@ def load_custom_image_assets(
             response = requests.get(url, timeout=20)
             response.raise_for_status()
             image = Image.open(io.BytesIO(response.content)).convert("RGB")
-            stem = Path(url.split("?")[0]).stem or "link-image"
+            link_path = url.split("?")[0]
+            stem = Path(link_path).stem or "link-image"
             assets.append(
                 {
-                    "slug": slugify_filename(stem, 0),
-                    "pic_no": normalize_pic_no(stem),
+                    "slug": slugify_filename(stem, len(assets)),
+                    "pic_no": extract_pic_no_from_filename(link_path),
                     "image": image,
                 }
             )
@@ -571,6 +613,19 @@ async def build_ai_row_backgrounds(records: List[Dict[str, Any]], session_id: st
     return [apply_background_variation(ai_pool[index % len(ai_pool)], index) for index in range(len(records))]
 
 
+def _sort_assets_for_sequential(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(item: tuple[int, Dict[str, Any]]) -> tuple[int, int]:
+        idx, asset = item
+        pic_no = clean_text(asset.get("pic_no"))
+        if pic_no.isdigit():
+            return (0, int(pic_no))
+        return (1, idx)
+
+    indexed = list(enumerate(assets))
+    indexed.sort(key=sort_key)
+    return [asset for _, asset in indexed]
+
+
 def build_custom_row_backgrounds(
     records: List[Dict[str, Any]],
     assets: List[Dict[str, Any]],
@@ -579,39 +634,73 @@ def build_custom_row_backgrounds(
     if not assets:
         raise HTTPException(status_code=400, detail="Custom mode requires uploaded images or image links.")
 
+    strategy = clean_text(mapping_strategy).lower() or "pin_name_match_then_sequential"
+    allow_sequential = strategy != "pic_no_only"
+
     pic_map: Dict[str, Image.Image] = {}
+    slug_map: Dict[str, Image.Image] = {}
     for asset in assets:
         pic_no_key = clean_text(asset.get("pic_no"))
         if pic_no_key and pic_no_key not in pic_map:
             pic_map[pic_no_key] = asset["image"]
+        slug = clean_text(asset.get("slug"))
+        if slug and slug not in slug_map:
+            slug_map[slug] = asset["image"]
 
+    ordered_assets = _sort_assets_for_sequential(assets)
     row_backgrounds: List[Image.Image] = []
     matched_records: List[Dict[str, Any]] = []
     missing_warnings: List[str] = []
-    missing_count = 0
-    matched_count = 0
 
     for index, row in enumerate(records, start=1):
+        base_image: Image.Image | None = None
         pic_no_key = normalize_pic_no(row.get("PIC NO."))
-        base_image = pic_map.get(pic_no_key) if pic_no_key else None
+
+        if pic_no_key:
+            base_image = pic_map.get(pic_no_key)
+
+        if base_image is None and allow_sequential:
+            pin_slug = slugify_filename(clean_text(row.get("PIN NAME")), index - 1)
+            base_image = slug_map.get(pin_slug)
+
+        if base_image is None and allow_sequential and index - 1 < len(ordered_assets):
+            base_image = ordered_assets[index - 1]["image"]
+            if pic_no_key:
+                missing_warnings.append(
+                    f"Row {index}: no file matched PIC NO. {pic_no_key}; used image #{index} in upload order."
+                )
+            else:
+                missing_warnings.append(
+                    f"Row {index}: matched image #{index} by upload order (no PIC NO. on row)."
+                )
+
+        if base_image is None and ordered_assets:
+            base_image = ordered_assets[(index - 1) % len(ordered_assets)]["image"]
+            missing_warnings.append(
+                f"Row {index}: reused image #{(index - 1) % len(ordered_assets) + 1} from your uploads."
+            )
 
         if base_image is None:
-            missing_count += 1
-            missing_warnings.append(f"Image not found for PIC NO. {pic_no_key or 'N/A'} (row {index}).")
+            missing_warnings.append(f"Row {index}: skipped — no image available.")
             continue
 
         matched_records.append(row)
-        matched_count += 1
         row_backgrounds.append(apply_background_variation(base_image, index - 1))
 
     if not matched_records:
-        raise HTTPException(status_code=400, detail="No custom images matched the provided PIC NO. values.")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No pins could be created from your images. "
+                "Name files like 1.jpg, 2.png (matching PIC NO.) or upload one image per Excel row in order."
+            ),
+        )
 
     return {
         "records": matched_records,
         "backgrounds": row_backgrounds,
-        "matched_count": matched_count,
-        "missing_count": missing_count,
+        "matched_count": len(matched_records),
+        "missing_count": len(records) - len(matched_records),
         "warnings": missing_warnings,
     }
 
@@ -670,15 +759,16 @@ ROW_SKIP_MARKERS = (
     "font style",
     "pixels",
     "1:2.1",
-    "ratio",
-    "cormorant",
-    "chewy",
-    "cursive",
     "1000 x",
     "1200 x",
     "standard pin",
     "long pin",
     "big pin",
+)
+
+INSTRUCTION_ROW_RE = re.compile(
+    r"pin\s*size\s*:|font\s*size\s*:|1000\s*[x×]\s*\d+|1200\s*[x×]\s*\d+|standard\s+pin|long\s+pin|big\s+pin",
+    re.I,
 )
 
 
@@ -694,6 +784,10 @@ def row_looks_like_instruction(row_values: Any) -> bool:
     blob = _row_text_blob(row_values)
     if not blob:
         return False
+    if INSTRUCTION_ROW_RE.search(blob):
+        return True
+    if len(blob) < 120 and "ratio" in blob and ("pixel" in blob or "1000" in blob or "1200" in blob):
+        return True
     return any(marker in blob for marker in ROW_SKIP_MARKERS)
 
 
@@ -726,7 +820,7 @@ def build_multi_title_column_map(header_cells: List[Any]) -> Dict[str, int]:
 def detect_multi_title_layout(raw_dataframe: pd.DataFrame) -> tuple[int, int] | None:
     """Return (header_row_index, first_data_row_index) for multi-title workbooks."""
     scan_limit = min(len(raw_dataframe), 40)
-    if scan_limit < 2:
+    if scan_limit < 1:
         return None
 
     for row_idx in range(scan_limit):
@@ -736,6 +830,22 @@ def detect_multi_title_layout(raw_dataframe: pd.DataFrame) -> tuple[int, int] | 
             if clean_text(value)
         }
         if "picno" in row_set and row_set.intersection(MULTI_TITLE_HEADER_ALIASES):
+            return row_idx, row_idx + 1
+
+    for row_idx in range(scan_limit):
+        header_cells = raw_dataframe.iloc[row_idx].tolist()
+        col_map = build_multi_title_column_map(header_cells)
+        normalized_in_row = {
+            normalize_header_name(value)
+            for value in header_cells
+            if clean_text(value)
+        }
+        has_pic = "PIC NO." in col_map or "picno" in normalized_in_row
+        has_title = any(
+            field in col_map
+            for field in ("PIN TITLE - TOP", "PIN TITLE - CENTER", "PIN TITLE - BOTTOM", "PIN TITLE 2ND LINE")
+        )
+        if has_pic and (has_title or "pinname" in normalized_in_row):
             return row_idx, row_idx + 1
 
     for row_idx in range(scan_limit - 1):
@@ -760,18 +870,11 @@ def detect_multi_title_layout(raw_dataframe: pd.DataFrame) -> tuple[int, int] | 
 
 
 def find_multi_title_data_end(raw_dataframe: pd.DataFrame, data_start_row: int) -> int:
-    """Exclusive end row — stops before footer notes or long blank runs."""
-    consecutive_empty = 0
+    """Exclusive end row — stops before footer notes, not on blank rows in the middle."""
     for row_idx in range(data_start_row, len(raw_dataframe)):
         row_values = raw_dataframe.iloc[row_idx].tolist()
         if row_looks_like_instruction(row_values):
             return row_idx
-        if is_whitespace_row(row_values):
-            consecutive_empty += 1
-            if consecutive_empty >= 8:
-                return row_idx - consecutive_empty
-            continue
-        consecutive_empty = 0
     return len(raw_dataframe)
 
 
@@ -1200,6 +1303,15 @@ def get_style_font(size: int, style: str) -> ImageFont.FreeTypeFont | ImageFont.
         if dancing_reg:
             return dancing_reg
         return get_font(size, bold=False)
+
+    if style_key == "playfair":
+        playfair = _load_font_file(fonts_dir / "PlayfairDisplay-Bold.ttf", size)
+        if playfair:
+            return playfair
+        playfair_reg = _load_font_file(fonts_dir / "PlayfairDisplay-Regular.ttf", size)
+        if playfair_reg:
+            return playfair_reg
+        return get_font(size, bold=True)
 
     return get_font(size, bold=True)
 
@@ -1750,7 +1862,7 @@ async def generate_pins(
     end_line_text_color = clean_text(end_line_color) or "#121218"
     quote_text_color = clean_text(legacy_quote_color) or "#FFFFFF"
 
-    total_limit = min(max_pins, 100)
+    total_limit = min(max_pins, 500)
     data_file_name = clean_text(data_file.filename)
     if not data_file_name.lower().endswith((".xlsx", ".csv")):
         raise HTTPException(
@@ -1785,8 +1897,9 @@ async def generate_pins(
         pic_no_value = normalize_pic_no(row.get("PIC NO."))
 
         if mode == "custom" and not pic_no_value:
-            skipped_warnings.append(f"Skipped row {row_index}: missing or invalid PIC NO.")
-            continue
+            skipped_warnings.append(
+                f"Row {row_index}: no PIC NO. — will match by upload order if needed."
+            )
 
         title_top_value = clean_text(row.get("PIN TITLE - TOP"))
         title_center_value = clean_text(row.get("PIN TITLE - CENTER"))

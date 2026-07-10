@@ -13,3 +13,7 @@ services:
         sync: false
       - key: CORS_ORIGINS
         value: "*"
+      - key: RENDER
+        value: "true"
+      - key: MAX_EPHEMERAL_SESSIONS
+        value: "3"

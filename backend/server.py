@@ -19,6 +19,7 @@ import json
 import re
 import shutil
 import zipfile
+import gc
 
 import pandas as pd
 import requests
@@ -42,7 +43,71 @@ if mongo_url:
     db_name = os.environ.get("DB_NAME", "pinterest_pins").strip() or "pinterest_pins"
     db = client[db_name]
 
-MAX_EPHEMERAL_SESSIONS = max(1, int(os.environ.get("MAX_EPHEMERAL_SESSIONS", "40")))
+MAX_EPHEMERAL_SESSIONS = max(
+    1,
+    int(
+        os.environ.get(
+            "MAX_EPHEMERAL_SESSIONS",
+            "3" if os.environ.get("RENDER", "").strip().lower() in ("true", "1", "yes") else "40",
+        )
+    ),
+)
+
+RENDER_BATCH_CAPS: Dict[str, int] = {
+    "standard": int(os.environ.get("RENDER_CAP_STANDARD", "15")),
+    "long": int(os.environ.get("RENDER_CAP_LONG", "10")),
+    "big": int(os.environ.get("RENDER_CAP_BIG", "8")),
+}
+_FONT_CACHE_MAX = max(16, int(os.environ.get("FONT_CACHE_MAX", "48")))
+
+
+def _is_low_memory_host() -> bool:
+    return os.environ.get("RENDER", "").strip().lower() in ("true", "1", "yes") or os.environ.get(
+        "LOW_MEMORY_MODE", ""
+    ).strip().lower() in ("true", "1", "yes")
+
+
+def _generation_concurrency() -> int:
+    default = "1" if _is_low_memory_host() else "6"
+    return max(1, min(10, int(os.environ.get("GENERATION_CONCURRENCY", default))))
+
+
+def _batch_cap_for_pin_size(pin_size_key: str) -> int | None:
+    if not _is_low_memory_host():
+        return None
+    return RENDER_BATCH_CAPS.get(pin_size_key, RENDER_BATCH_CAPS["standard"])
+
+
+def _max_background_pixels(pin_size_key: str) -> int:
+    width, height = PIN_SIZE_PRESETS.get(pin_size_key, PIN_SIZE_PRESETS["standard"])
+    return width * height
+
+
+def _release_pil_image(image: Image.Image | None) -> None:
+    if image is not None:
+        try:
+            image.close()
+        except Exception:
+            pass
+
+
+def _release_background_list(backgrounds: List[Image.Image | None]) -> None:
+    seen: set[int] = set()
+    for image in backgrounds:
+        if image is None:
+            continue
+        image_id = id(image)
+        if image_id in seen:
+            continue
+        seen.add(image_id)
+        _release_pil_image(image)
+    backgrounds.clear()
+
+
+def _release_custom_assets(assets: List[Dict[str, Any]]) -> None:
+    for asset in assets:
+        _release_pil_image(asset.get("image"))
+
 _EPHEMERAL_LOCK = asyncio.Lock()
 _EPHEMERAL_SESSION_ORDER: deque[str] = deque()
 _EPHEMERAL_PINS_BY_SESSION: Dict[str, List[Dict[str, Any]]] = {}
@@ -168,6 +233,8 @@ LEGACY_FONT_SIZE_ALIASES: Dict[str, int] = {
 }
 
 VALID_FONT_STYLES = {"bold", "italic", "chewy", "cursive", "playfair"}
+
+_FONT_CACHE: Dict[tuple[str, int], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
 HEADER_ALIASES: Dict[str, List[str]] = {
     "PIC NO.": ["picno", "picno.", "picnumber", "pic"],
@@ -351,6 +418,30 @@ def create_placeholder_background() -> Image.Image:
     return image
 
 
+def prepare_background_image(image: Image.Image, max_size: tuple[int, int] = (1800, 2700)) -> Image.Image:
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    width, height = image.size
+    max_width, max_height = max_size
+    if width > max_width or height > max_height:
+        image = ImageOps.contain(image, max_size, method=Image.Resampling.LANCZOS)
+    return image
+
+
+def normalize_uploaded_background(image: Image.Image, pin_size_key: str = "standard") -> Image.Image:
+    """Downscale uploads so we never hold huge photos in RAM during batch generation."""
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    cap = _max_background_pixels(pin_size_key)
+    if _is_low_memory_host():
+        cap = min(cap, 900 * 900)
+    if width * height <= cap:
+        return rgb
+    scale = (cap / (width * height)) ** 0.5
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    return rgb.resize(new_size, Image.Resampling.LANCZOS)
+
+
 def load_backgrounds() -> List[Image.Image]:
     backgrounds: List[Image.Image] = []
     for url in MOCK_IMAGE_URLS:
@@ -463,7 +554,7 @@ async def generate_gemini_background(
     if not raw_bytes:
         raise AIImageGenerationError("Gemini returned empty image data")
 
-    return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    return prepare_background_image(Image.open(io.BytesIO(raw_bytes)).convert("RGB"))
 
 
 async def build_ai_background_pool(records: List[Dict[str, Any]], session_id: str) -> List[Image.Image]:
@@ -562,6 +653,7 @@ def parse_image_links(image_links_raw: str) -> List[str]:
 def load_custom_image_assets(
     file_entries: List[Dict[str, Any]],
     image_links_raw: str,
+    pin_size_key: str = "standard",
 ) -> List[Dict[str, Any]]:
     assets: List[Dict[str, Any]] = []
 
@@ -571,7 +663,8 @@ def load_custom_image_assets(
         if not filename or not content or not is_supported_image_name(filename):
             continue
         try:
-            image = Image.open(io.BytesIO(content)).convert("RGB")
+            with Image.open(io.BytesIO(content)) as opened:
+                image = normalize_uploaded_background(opened, pin_size_key)
             base_name = Path(filename.replace("\\", "/")).name
             stem = Path(base_name).stem
             assets.append(
@@ -583,6 +676,8 @@ def load_custom_image_assets(
             )
         except Exception:
             logger.warning("Skipping invalid custom image file: %s", filename)
+        finally:
+            del content
 
     for url in parse_image_links(image_links_raw):
         try:
@@ -591,7 +686,8 @@ def load_custom_image_assets(
                 continue
             response = requests.get(url, timeout=20)
             response.raise_for_status()
-            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            with Image.open(io.BytesIO(response.content)) as opened:
+                image = normalize_uploaded_background(opened, pin_size_key)
             link_path = url.split("?")[0]
             stem = Path(link_path).stem or "link-image"
             assets.append(
@@ -607,10 +703,16 @@ def load_custom_image_assets(
     return assets
 
 
-async def build_ai_row_backgrounds(records: List[Dict[str, Any]], session_id: str) -> List[Image.Image]:
-    ai_pool = await build_ai_background_pool(records, session_id)
-
-    return [apply_background_variation(ai_pool[index % len(ai_pool)], index) for index in range(len(records))]
+async def build_ai_row_background_sources(records: List[Dict[str, Any]], session_id: str) -> List[Image.Image]:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        logger.warning("Gemini API key missing, using local placeholder backgrounds.")
+        return load_backgrounds()
+    try:
+        return await build_ai_background_pool(records, session_id)
+    except AIImageGenerationError as exc:
+        logger.warning("Gemini image generation unavailable: %s. Falling back to local backgrounds.", exc)
+        return load_backgrounds()
 
 
 def _sort_assets_for_sequential(assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -648,9 +750,20 @@ def build_custom_row_backgrounds(
             slug_map[slug] = asset["image"]
 
     ordered_assets = _sort_assets_for_sequential(assets)
-    row_backgrounds: List[Image.Image] = []
+    source_images: List[Image.Image] = []
+    source_index_map: Dict[int, int] = {}
+    row_background_indexes: List[int] = []
     matched_records: List[Dict[str, Any]] = []
     missing_warnings: List[str] = []
+
+    def register_source(image: Image.Image) -> int:
+        image_id = id(image)
+        if image_id in source_index_map:
+            return source_index_map[image_id]
+        index = len(source_images)
+        source_images.append(image)
+        source_index_map[image_id] = index
+        return index
 
     for index, row in enumerate(records, start=1):
         base_image: Image.Image | None = None
@@ -685,7 +798,7 @@ def build_custom_row_backgrounds(
             continue
 
         matched_records.append(row)
-        row_backgrounds.append(apply_background_variation(base_image, index - 1))
+        row_background_indexes.append(register_source(base_image))
 
     if not matched_records:
         raise HTTPException(
@@ -698,7 +811,8 @@ def build_custom_row_backgrounds(
 
     return {
         "records": matched_records,
-        "backgrounds": row_backgrounds,
+        "background_sources": source_images,
+        "row_background_indexes": row_background_indexes,
         "matched_count": len(matched_records),
         "missing_count": len(records) - len(matched_records),
         "warnings": missing_warnings,
@@ -803,7 +917,7 @@ def _header_cell_matches_field(normalized_cell: str, field: str) -> bool:
     return normalized_cell == field_norm
 
 
-def build_multi_title_column_map(header_cells: List[Any]) -> Dict[str, int]:
+def build_multi_title_column_map(header_cells: List[Any], include_defaults: bool = False) -> Dict[str, int]:
     col_map: Dict[str, int] = {}
     for idx, cell in enumerate(header_cells):
         norm = normalize_header_name(cell)
@@ -814,8 +928,9 @@ def build_multi_title_column_map(header_cells: List[Any]) -> Dict[str, int]:
                 continue
             if _header_cell_matches_field(norm, field):
                 col_map[field] = idx
-    for field, idx in DEFAULT_MULTI_TITLE_COLUMNS.items():
-        col_map.setdefault(field, idx)
+    if include_defaults:
+        for field, idx in DEFAULT_MULTI_TITLE_COLUMNS.items():
+            col_map.setdefault(field, idx)
     return col_map
 
 
@@ -972,7 +1087,7 @@ def parse_multi_title_pin_layout(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
         raise HTTPException(status_code=400, detail="No data rows found in multi-title PIN section.")
 
     header_cells = raw_dataframe.iloc[header_row_index].tolist()
-    col_map = build_multi_title_column_map(header_cells)
+    col_map = build_multi_title_column_map(header_cells, include_defaults=True)
 
     def get_column(field: str) -> pd.Series:
         index = col_map.get(field, -1)
@@ -1253,29 +1368,44 @@ def _truetype_font_candidates(bold: bool) -> List[str]:
     ]
 
 
+def _cache_font(cache_key: tuple[str, int], font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    if cache_key in _FONT_CACHE:
+        return _FONT_CACHE[cache_key]
+    while len(_FONT_CACHE) >= _FONT_CACHE_MAX:
+        _FONT_CACHE.pop(next(iter(_FONT_CACHE)))
+    _FONT_CACHE[cache_key] = font
+    return font
+
+
 def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     size = max(8, int(size))
+    cache_key = ("bold" if bold else "regular", size)
+    if cache_key in _FONT_CACHE:
+        return _FONT_CACHE[cache_key]
+
     for candidate in _truetype_font_candidates(bold):
         try:
             path = Path(candidate)
-            # Try direct file path when present, otherwise let Pillow resolve font names.
             if path.is_file():
-                return ImageFont.truetype(str(path), size=size)
-            return ImageFont.truetype(candidate, size=size)
+                font = ImageFont.truetype(str(path), size=size)
+                return _cache_font(cache_key, font)
+            font = ImageFont.truetype(candidate, size=size)
+            return _cache_font(cache_key, font)
         except OSError:
             continue
     try:
-        return ImageFont.truetype("arial.ttf", size=size)
+        font = ImageFont.truetype("arial.ttf", size=size)
+        return _cache_font(cache_key, font)
     except OSError:
         logging.getLogger(__name__).warning(
             "Pin fonts: no TrueType file found (install fonts or add backend/assets/fonts/DejaVuSans-Bold.ttf); "
             "Pillow default bitmap font is very small."
         )
-        # Pillow >=10 supports a size argument; older versions ignore it.
         try:
-            return ImageFont.load_default(size=size)
+            font = ImageFont.load_default(size=size)
         except TypeError:
-            return ImageFont.load_default()
+            font = ImageFont.load_default()
+        return _cache_font(cache_key, font)
 
 
 def get_quote_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -1737,7 +1867,11 @@ def create_pin_payload(
     base_slug = slugify_filename(pin_name or quote, index)
     file_name = make_unique_filename(session_dir, base_slug)
     file_path = session_dir / file_name
-    rendered.save(file_path, format="PNG")
+    try:
+        rendered.save(file_path, format="PNG", optimize=True)
+    finally:
+        _release_pil_image(rendered)
+        _release_pil_image(background_image)
 
     return {
         "pin_id": str(uuid.uuid4()),
@@ -1792,7 +1926,11 @@ async def validate_excel(data_file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Upload must be .xlsx or .csv")
 
     file_bytes = await data_file.read()
-    dataframe = parse_file(data_file_name, file_bytes)
+    try:
+        dataframe = parse_file(data_file_name, file_bytes)
+    finally:
+        del file_bytes
+        gc.collect()
     if dataframe.empty:
         raise HTTPException(status_code=400, detail="Spreadsheet has no usable pin rows.")
 
@@ -1901,6 +2039,15 @@ async def generate_pins(
     quote_text_color = clean_text(legacy_quote_color) or "#FFFFFF"
 
     total_limit = min(max_pins, 500)
+    batch_cap = _batch_cap_for_pin_size(pin_size_key)
+    batch_cap_warning = ""
+    if batch_cap is not None:
+        if max_pins > batch_cap:
+            batch_cap_warning = (
+                f"Server memory limit: generating at most {batch_cap} {pin_size_key} pins per batch. "
+                "Run again for more rows, or use Standard size for larger batches."
+            )
+        total_limit = min(total_limit, batch_cap)
     data_file_name = clean_text(data_file.filename)
     if not data_file_name.lower().endswith((".xlsx", ".csv")):
         raise HTTPException(
@@ -1909,7 +2056,11 @@ async def generate_pins(
         )
 
     file_bytes = await data_file.read()
-    dataframe = parse_file(data_file_name, file_bytes)
+    try:
+        dataframe = parse_file(data_file_name, file_bytes)
+    finally:
+        del file_bytes
+        gc.collect()
 
     if dataframe.empty:
         raise HTTPException(status_code=400, detail="Uploaded file has no rows")
@@ -1966,6 +2117,8 @@ async def generate_pins(
         )
 
     records = valid_records
+    if batch_cap_warning and len(records) >= (batch_cap or 0):
+        skipped_warnings.insert(0, batch_cap_warning)
 
     session_id = str(uuid.uuid4())
     session_dir = GENERATED_PINS_DIR / session_id
@@ -2000,7 +2153,7 @@ async def generate_pins(
 
     custom_assets: List[Dict[str, Any]] = []
     if custom_file_entries or clean_text(image_links):
-        custom_assets = await asyncio.to_thread(load_custom_image_assets, custom_file_entries, image_links)
+        custom_assets = await asyncio.to_thread(load_custom_image_assets, custom_file_entries, image_links, pin_size_key)
 
     if mode == "ai" and not os.environ.get("GEMINI_API_KEY", "").strip() and not custom_assets and template_obj is None:
         raise HTTPException(
@@ -2011,8 +2164,9 @@ async def generate_pins(
             ),
         )
 
+    row_background_indexes: list[int] = list(range(len(records)))
     if template_obj is not None:
-        row_backgrounds = [template_obj.copy() for _ in records]
+        row_background_sources = [template_obj.copy() for _ in records]
         images_matched = len(records)
         missing_images_count = 0
     else:
@@ -2024,13 +2178,14 @@ async def generate_pins(
                 mapping_strategy,
             )
             records = custom_result["records"]
-            row_backgrounds = custom_result["backgrounds"]
+            row_background_sources = custom_result["background_sources"]
+            row_background_indexes = custom_result["row_background_indexes"]
             images_matched = custom_result["matched_count"]
             missing_images_count = custom_result["missing_count"]
             skipped_warnings.extend(custom_result["warnings"])
         else:
             try:
-                row_backgrounds = await build_ai_row_backgrounds(records, session_id)
+                row_background_sources = await build_ai_row_background_sources(records, session_id)
                 images_matched = len(records)
                 missing_images_count = 0
             except AIQuotaExceededError:
@@ -2042,7 +2197,8 @@ async def generate_pins(
                         mapping_strategy,
                     )
                     records = custom_result["records"]
-                    row_backgrounds = custom_result["backgrounds"]
+                    row_background_sources = custom_result["background_sources"]
+                    row_background_indexes = custom_result["row_background_indexes"]
                     images_matched = custom_result["matched_count"]
                     missing_images_count = custom_result["missing_count"]
                     skipped_warnings.extend(custom_result["warnings"])
@@ -2069,7 +2225,8 @@ async def generate_pins(
                         mapping_strategy,
                     )
                     records = custom_result["records"]
-                    row_backgrounds = custom_result["backgrounds"]
+                    row_background_sources = custom_result["background_sources"]
+                    row_background_indexes = custom_result["row_background_indexes"]
                     images_matched = custom_result["matched_count"]
                     missing_images_count = custom_result["missing_count"]
                     skipped_warnings.extend(custom_result["warnings"])
@@ -2093,10 +2250,11 @@ async def generate_pins(
     GENERATION_TRACKER[session_id] = generation_progress
     progress_lock = asyncio.Lock()
 
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(_generation_concurrency())
 
     async def process_row(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
         async with semaphore:
+            background_base = row_background_sources[row_background_indexes[index] % len(row_background_sources)].copy()
             pin = await asyncio.to_thread(
                 create_pin_payload,
                 row,
@@ -2104,7 +2262,7 @@ async def generate_pins(
                 session_id,
                 session_dir,
                 template_text_position,
-                row_backgrounds[index].copy(),
+                background_base,
                 mode_used,
                 pin_size_key,
                 title_count_value,
@@ -2122,8 +2280,13 @@ async def generate_pins(
                 generation_progress["generated_count"] += 1
             return pin
 
-    tasks = [process_row(index, row) for index, row in enumerate(records)]
-    generated = await asyncio.gather(*tasks)
+    try:
+        tasks = [process_row(index, row) for index, row in enumerate(records)]
+        generated = await asyncio.gather(*tasks)
+    finally:
+        _release_background_list(row_background_sources)
+        _release_custom_assets(custom_assets)
+        gc.collect()
     generation_progress["completed"] = True
 
     pin_docs = [dict(pin) for pin in generated]
